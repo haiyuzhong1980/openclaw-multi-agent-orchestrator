@@ -10,9 +10,33 @@ const DELEGATION_MARKERS: string[] = [
   "总控", "编排", "所有 agent", "多个 agent",
   // Chinese - strong intent signals
   "真实执行", "全力推进", "全面推进",
+  // From mining — user's actual delegation language
+  "推进", "强力推进", "直接推进",
+  "落实", "开工", "准备开工",
+  "产品经理",
+  "里程碑", "任务看板", "任务清单", "进度表",
+  "出报告", "出测试报告", "出审查报告", "出验收报告",
+  "每一个里程碑", "每完成一个",
+  "召唤", "集合",
+  "全面审查", "全面审核", "全面优化", "全面提升",
+  "深度思考", "最大思考",
+  "释放",
+  "组成团队", "团队开发",
   // English
   "multi agent", "multi-agent", "subagent", "sub-agent", "delegate", "dispatch",
   "worker", "orchestrate", "parallel", "all agents", "comprehensive",
+];
+
+// Regex-based delegation patterns — structural patterns, not fixed strings
+const DELEGATION_REGEX: RegExp[] = [
+  /从.*推进到/,                                         // "从M0推进到M4"
+  /回到.*(?:那条|开发|路线|主线)/,                        // "回到那条开发线"
+  /你.*(?:是|当).*(?:总控|产品经理|架构师)/,               // role assignment
+  /每.*(?:里程碑|阶段|节点).*(?:检查|测试|审查|验收)/,     // milestone review pattern
+  /(?:派出|调度|启动).*(?:所有|全部|多个)/,               // dispatch all
+  /释放.*(?:力量|能力|agent)/,                           // "释放你的最大力量"
+  /全力.*(?:推进|开干|执行|开发)/,                       // "全力推进"
+  /(?:组成|组建).*(?:团队|小组)/,                        // "组成团队开发"
 ];
 
 // TRACKED markers — need compound evidence
@@ -26,8 +50,22 @@ const TRACKED_MARKERS: string[] = [
   "创建", "构建", "搭建", "编写", "设计",
   "清理", "整理", "归档", "备份", "恢复",
   // Chinese - workflow signals
-  "分步骤", "按步骤", "汇报进度", "里程碑", "阶段", "路线", "主线", "支线",
-  "跑通", "出报告", "M0", "M1", "M2", "M3", "M4", "P0", "P1", "P2",
+  "分步骤", "按步骤", "汇报进度", "阶段", "路线", "主线", "支线",
+  "跑通", "M0", "M1", "M2", "M3", "M4", "P0", "P1", "P2",
+  // From mining — user's actual tracked language
+  "帮我配置", "帮我重启", "帮我找", "帮我看",
+  "你先检查", "你先审查", "你查一下", "你去看看", "你去读",
+  "启动", "重启", "停止",
+  "修复所有", "修复这个",
+  "推送到", "同步到", "部署到",
+  "保存到", "写入", "记住",
+  "写个", "写一个", "创建一个",
+  "403", "521", "报错", "出错", "失败",
+  "知识库", "文档", "readme",
+  "ssh", "服务器", "远程",
+  "github", "仓库", "repo",
+  "打包", "发布", "上线",
+  "读取", "加载", "扫描",
   // English - task verbs
   "step by step", "report progress", "deploy", "install", "configure",
   "develop", "implement", "refactor", "migrate", "upgrade",
@@ -45,10 +83,14 @@ const ACTION_VERBS: string[] = [
   "审计", "评测", "审查", "分析", "调研", "测试", "部署", "检查",
   "开发", "实现", "优化", "修复", "重构", "迁移", "设计", "构建",
   "验收", "评估", "研究", "排查", "清理", "整理",
+  "配置", "安装", "升级", "发布", "打包", "推送", "同步",
+  "编写", "创建", "搭建", "改造", "改进",
+  "扫描", "读取", "加载", "备份", "恢复",
   // English
   "audit", "review", "test", "deploy", "analyze", "research",
   "develop", "implement", "optimize", "fix", "refactor", "build",
-  "evaluate", "investigate", "design", "verify",
+  "evaluate", "investigate", "design", "verify", "configure",
+  "install", "upgrade", "publish", "sync", "scan", "backup",
 ];
 
 export function inferExecutionComplexity(
@@ -72,19 +114,30 @@ export function inferExecutionComplexity(
     }
   }
 
-  // Short-circuit: trivial messages
-  if (text.length < 15) return "light";
+  // Ultra-narrow light detection — only bare acknowledgments
+  if (text.length <= 6) {
+    const bareAcks = /^(ok|好|好的|嗯|是的|可以|明白|对|行|收到|谢谢|thanks|yes|no)$/i;
+    if (bareAcks.test(text.trim())) return "light";
+  }
 
-  // Short-circuit: greetings
-  const trivialPatterns = [
-    /^(你好|hello|hi|hey|ok|好的|收到|谢谢|thanks|yes|no|是|不是|对|嗯|可以|行|明白)/i,
-  ];
-  if (trivialPatterns.some((p) => p.test(text))) return "light";
+  // Short greetings only (not short work commands!)
+  if (/^(你好|hello|hi|hey)[\s!！.。]*$/i.test(text.trim())) return "light";
+
+  // Explicit choice responses: "方案A", "方案B" etc
+  if (/^方案\s*[A-Za-z0-9]$/i.test(text.trim())) return "light";
+
+  // Empty input
+  if (text.length === 0) return "light";
 
   // Check learned patterns from intent registry
   if (intentRegistry) {
     const learnedTier = checkLearnedPatterns(lower, intentRegistry);
     if (learnedTier) return learnedTier;
+  }
+
+  // Regex-based delegation patterns (before static marker check)
+  if (DELEGATION_REGEX.some((r) => r.test(text))) {
+    return "delegation";
   }
 
   // Static delegation markers (any one is enough)
@@ -116,6 +169,9 @@ export function inferExecutionComplexity(
   // Long message (>100 chars) with 1 action verb = tracked
   if (uniqueActions.length >= 1 && text.length > 100) return "tracked";
 
+  // Default to "tracked" for this user — 99% of messages are work requests
+  // Only explicit light indicators stay light
+  if (text.length > 6) return "tracked";
   return "light";
 }
 

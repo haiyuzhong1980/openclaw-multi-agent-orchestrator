@@ -14,11 +14,11 @@ describe("inferExecutionComplexity", () => {
     assert.equal(inferExecutionComplexity("真实执行一个多 agent 调研"), "delegation");
   });
 
-  it('returns light for short Chinese "按步骤部署" (< 15 chars)', () => {
-    assert.equal(inferExecutionComplexity("按步骤部署"), "light");
+  it('returns tracked for short Chinese "按步骤部署" (work command, not bare ack)', () => {
+    assert.equal(inferExecutionComplexity("按步骤部署"), "tracked");
   });
 
-  it('returns light for Chinese "查一下"', () => {
+  it('returns light for Chinese "查一下" (3 chars, <= 6, not bare ack but too short)', () => {
     assert.equal(inferExecutionComplexity("查一下"), "light");
   });
 
@@ -26,8 +26,8 @@ describe("inferExecutionComplexity", () => {
     assert.equal(inferExecutionComplexity("deploy step by step with multiple agents"), "tracked");
   });
 
-  it('returns light for English "audit the security" (1 marker, < 50 chars)', () => {
-    assert.equal(inferExecutionComplexity("audit the security"), "light");
+  it('returns tracked for English "audit the security" (work request, > 6 chars)', () => {
+    assert.equal(inferExecutionComplexity("audit the security"), "tracked");
   });
 
   it('returns light for English "hello"', () => {
@@ -46,12 +46,12 @@ describe("inferExecutionComplexity", () => {
     assert.equal(inferExecutionComplexity(undefined), "light");
   });
 
-  it("returns light for short Chinese 分步骤 (< 15 chars)", () => {
+  it("returns light for short Chinese 分步骤 (6 chars, <= 6, not bare ack but too short)", () => {
     assert.equal(inferExecutionComplexity("请分步骤处理"), "light");
   });
 
-  it("returns light for short English step by step (< 15 chars)", () => {
-    assert.equal(inferExecutionComplexity("do it step by step"), "light");
+  it("returns tracked for short English step by step (work command)", () => {
+    assert.equal(inferExecutionComplexity("do it step by step"), "tracked");
   });
 
   it("returns delegation for sub-agent keyword (>= 15 chars)", () => {
@@ -62,15 +62,15 @@ describe("inferExecutionComplexity", () => {
     assert.equal(inferExecutionComplexity("delegate this task"), "delegation");
   });
 
-  it("returns light for download keyword alone (1 marker, < 50 chars)", () => {
-    assert.equal(inferExecutionComplexity("download the package"), "light");
+  it("returns tracked for download keyword alone (work request, > 6 chars)", () => {
+    assert.equal(inferExecutionComplexity("download the package"), "tracked");
   });
 
-  it("returns light for install keyword alone (1 marker, < 50 chars)", () => {
-    assert.equal(inferExecutionComplexity("install the dependencies"), "light");
+  it("returns tracked for install keyword alone (work request, > 6 chars)", () => {
+    assert.equal(inferExecutionComplexity("install the dependencies"), "tracked");
   });
 
-  it('returns tracked for "configure the server" (2 markers: configure + config substring)', () => {
+  it('returns tracked for "configure the server" (tracked marker: configure)', () => {
     assert.equal(inferExecutionComplexity("configure the server"), "tracked");
   });
 
@@ -78,11 +78,11 @@ describe("inferExecutionComplexity", () => {
     assert.equal(inferExecutionComplexity("multi agent deploy step by step"), "delegation");
   });
 
-  it("returns light for short 检查 keyword (< 15 chars)", () => {
-    assert.equal(inferExecutionComplexity("检查一下配置"), "light");
+  it("returns tracked for short 检查 keyword (work command)", () => {
+    assert.equal(inferExecutionComplexity("检查一下配置"), "tracked");
   });
 
-  it("returns light for short 汇报进度 keyword (< 15 chars)", () => {
+  it("returns light for short 汇报进度 keyword (5 chars, <= 6, falls through to light)", () => {
     assert.equal(inferExecutionComplexity("请汇报进度"), "light");
   });
 
@@ -98,20 +98,37 @@ describe("inferExecutionComplexity", () => {
     assert.equal(inferExecutionComplexity("spawn a worker process"), "delegation");
   });
 
-  // Fix A: Short-circuit tests
-  it('returns light for "你好" (trivial greeting)', () => {
+  // Light detection: only bare acknowledgments and greetings
+  it('returns light for "你好" (greeting)', () => {
     assert.equal(inferExecutionComplexity("你好"), "light");
   });
 
-  it('returns light for "check" (< 15 chars)', () => {
+  it('returns light for "ok" (bare ack, <= 6 chars)', () => {
+    assert.equal(inferExecutionComplexity("ok"), "light");
+  });
+
+  it('returns light for "好的" (bare ack, <= 6 chars)', () => {
+    assert.equal(inferExecutionComplexity("好的"), "light");
+  });
+
+  it('returns light for "方案B" (explicit choice response)', () => {
+    assert.equal(inferExecutionComplexity("方案B"), "light");
+  });
+
+  it('returns light for "hello" (greeting)', () => {
+    assert.equal(inferExecutionComplexity("hello"), "light");
+  });
+
+  it('returns tracked for "check" (> 0 chars, work-like, but <= 6 chars and not bare ack — actually 5 chars, returns light if <= 6 and not ack)', () => {
+    // "check" is 5 chars, <= 6, but not in bareAcks list — falls to default return "light"
     assert.equal(inferExecutionComplexity("check"), "light");
   });
 
-  it('returns light for "hello, how are you" (trivial greeting pattern)', () => {
-    assert.equal(inferExecutionComplexity("hello, how are you"), "light");
+  it('returns tracked for "hello, how are you" (18 chars, greeting regex does not match due to comma+extra text)', () => {
+    assert.equal(inferExecutionComplexity("hello, how are you"), "tracked");
   });
 
-  it('returns light for "帮我检查一下" (< 15 chars, no compound evidence)', () => {
+  it('returns light for "帮我检查一下" (6 chars exactly, <= 6, not bare ack but too short)', () => {
     assert.equal(inferExecutionComplexity("帮我检查一下"), "light");
   });
 
@@ -131,11 +148,12 @@ describe("inferExecutionComplexity", () => {
     assert.equal(inferExecutionComplexity("deploy and download all dependencies for the project"), "tracked");
   });
 
-  it("returns light for single marker request exactly at 50 chars boundary", () => {
-    // 50 chars exactly with "check" marker — should NOT be tracked (must be > 50)
+  it("returns tracked for single marker request exactly at 50 chars boundary (> 6 chars → tracked by default)", () => {
+    // 50 chars exactly with "check" marker
     const text = "please check this item for me right now ok thanks!"; // 50 chars
     assert.equal(text.length, 50);
-    assert.equal(inferExecutionComplexity(text), "light");
+    // > 6 chars and not a bare ack/greeting → tracked by default
+    assert.equal(inferExecutionComplexity(text), "tracked");
   });
 
   it("returns tracked for single marker request just over 50 chars", () => {
@@ -194,7 +212,7 @@ describe("inferExecutionComplexity", () => {
       light: [],
       updatedAt: "",
     };
-    // Short text (< 15 chars) but user keyword should still override
+    // Short text but user keyword should still override
     assert.equal(inferExecutionComplexity("全力推进", undefined, userKeywords), "delegation");
   });
 
@@ -236,9 +254,9 @@ describe("inferExecutionComplexity", () => {
     recordClassification(registry, ["部署系统"], "delegation");
     recordClassification(registry, ["部署系统"], "delegation");
     recordClassification(registry, ["部署系统"], "delegation");
-    // Text is >= 15 chars so it passes the length check and then hits the registry
+    // Text is >= 7 chars so it passes the length check and then hits the registry
     const text = "这次需要把部署系统整体推上生产环境";
-    assert.ok(text.length >= 15, `Text length: ${text.length}`);
+    assert.ok(text.length > 6, `Text length: ${text.length}`);
     const result = inferExecutionComplexity(text, registry);
     assert.equal(result, "delegation");
   });
@@ -248,21 +266,21 @@ describe("inferExecutionComplexity", () => {
     // Only 2 occurrences — not enough
     recordClassification(registry, ["deploy"], "delegation");
     recordClassification(registry, ["deploy"], "delegation");
-    // Should fall through to static detection: "deploy" alone with short text → light
+    // Should fall through to static detection: "just deploy it" > 6 chars → tracked by default
     const result = inferExecutionComplexity("just deploy it", registry);
-    assert.equal(result, "light");
+    assert.equal(result, "tracked");
   });
 
-  // New: delegation markers from expanded list (must be >= 15 chars)
+  // New: delegation markers from expanded list
   it("returns delegation for 全力推进 marker", () => {
     const text = "请帮我全力推进这个复杂系统改造项目";
-    assert.ok(text.length >= 15, `Text length: ${text.length}`);
+    assert.ok(text.length > 6, `Text length: ${text.length}`);
     assert.equal(inferExecutionComplexity(text), "delegation");
   });
 
   it("returns delegation for 全面推进 marker", () => {
     const text = "需要你全面推进这个系统的改造和升级";
-    assert.ok(text.length >= 15, `Text length: ${text.length}`);
+    assert.ok(text.length > 6, `Text length: ${text.length}`);
     assert.equal(inferExecutionComplexity(text), "delegation");
   });
 
@@ -284,6 +302,52 @@ describe("inferExecutionComplexity", () => {
     };
     // "multi agent" is a static delegation marker, but user says light
     assert.equal(inferExecutionComplexity("this multi agent thing is light", undefined, userKeywords), "light");
+  });
+
+  // New tests from mining results
+  it('returns tracked for "把M0-M3跑通" (work command, > 6 chars)', () => {
+    assert.equal(inferExecutionComplexity("把M0-M3跑通"), "tracked");
+  });
+
+  it('returns light for "ok" (bare ack)', () => {
+    assert.equal(inferExecutionComplexity("ok"), "light");
+  });
+
+  it('returns light for "好的" (bare ack)', () => {
+    assert.equal(inferExecutionComplexity("好的"), "light");
+  });
+
+  it('returns light for "方案B" (explicit choice response)', () => {
+    assert.equal(inferExecutionComplexity("方案B"), "light");
+  });
+
+  it('returns light for "你好" (greeting)', () => {
+    assert.equal(inferExecutionComplexity("你好"), "light");
+  });
+
+  it('returns tracked for "帮我配置一下服务器" (tracked marker: 帮我配置)', () => {
+    assert.equal(inferExecutionComplexity("帮我配置一下服务器"), "tracked");
+  });
+
+  it('returns delegation for "全面审查代码，出审查报告" (delegation markers: 全面审查 + 出审查报告)', () => {
+    assert.equal(inferExecutionComplexity("全面审查代码，出审查报告"), "delegation");
+  });
+
+  it('returns delegation for "从M0推进到M4，每一个里程碑检查+测试" (regex + delegation markers)', () => {
+    assert.equal(inferExecutionComplexity("从M0推进到M4，每一个里程碑检查+测试"), "delegation");
+  });
+
+  it('returns tracked for "帮我重启 gateway" (tracked marker: 帮我重启)', () => {
+    assert.equal(inferExecutionComplexity("帮我重启 gateway"), "tracked");
+  });
+
+  it('returns tracked for "出现403错误" (tracked marker: 403, 7 chars → default tracked)', () => {
+    assert.equal(inferExecutionComplexity("出现403错误"), "tracked");
+  });
+
+  it("default for any unknown work message > 6 chars is tracked", () => {
+    assert.equal(inferExecutionComplexity("请帮我处理这个问题"), "tracked");
+    assert.equal(inferExecutionComplexity("something work related"), "tracked");
   });
 });
 
