@@ -1,71 +1,121 @@
 import type { DelegationStartGateMode, ExecutionGuardRequest, ExecutionPolicyMode } from "./types.ts";
+import type { IntentRegistry } from "./intent-registry.ts";
+import type { UserKeywords } from "./user-keywords.ts";
+import { checkLearnedPatterns } from "./intent-registry.ts";
 
-export function inferExecutionComplexity(request?: string): "light" | "tracked" | "delegation" {
+// DELEGATION markers — any ONE of these triggers delegation
+const DELEGATION_MARKERS: string[] = [
+  // Chinese - explicit delegation
+  "多 agent", "子 agent", "主 agent", "派出", "派遣", "调度", "分工", "并行",
+  "总控", "编排", "所有 agent", "多个 agent",
+  // Chinese - strong intent signals
+  "真实执行", "全力推进", "全面推进",
+  // English
+  "multi agent", "multi-agent", "subagent", "sub-agent", "delegate", "dispatch",
+  "worker", "orchestrate", "parallel", "all agents", "comprehensive",
+];
+
+// TRACKED markers — need compound evidence
+const TRACKED_MARKERS: string[] = [
+  // Chinese - task verbs (broad coverage)
+  "部署", "安装", "配置", "开发", "实现", "重构", "迁移", "升级",
+  "审计", "审查", "审核", "检查", "检测", "检验",
+  "测试", "评测", "评估", "验收", "验证",
+  "分析", "调研", "研究", "探索", "排查",
+  "优化", "修复", "修改", "改进", "改造",
+  "创建", "构建", "搭建", "编写", "设计",
+  "清理", "整理", "归档", "备份", "恢复",
+  // Chinese - workflow signals
+  "分步骤", "按步骤", "汇报进度", "里程碑", "阶段", "路线", "主线", "支线",
+  "跑通", "出报告", "M0", "M1", "M2", "M3", "M4", "P0", "P1", "P2",
+  // English - task verbs
+  "step by step", "report progress", "deploy", "install", "configure",
+  "develop", "implement", "refactor", "migrate", "upgrade",
+  "audit", "review", "inspect", "test", "evaluate", "verify",
+  "analyze", "research", "investigate", "troubleshoot",
+  "optimize", "fix", "improve", "redesign",
+  "build", "create", "design", "write",
+  "milestone", "roadmap", "workflow", "phase", "pipeline",
+  "download", "check", "config",
+];
+
+// ACTION VERBS for compound detection
+const ACTION_VERBS: string[] = [
+  // Chinese
+  "审计", "评测", "审查", "分析", "调研", "测试", "部署", "检查",
+  "开发", "实现", "优化", "修复", "重构", "迁移", "设计", "构建",
+  "验收", "评估", "研究", "排查", "清理", "整理",
+  // English
+  "audit", "review", "test", "deploy", "analyze", "research",
+  "develop", "implement", "optimize", "fix", "refactor", "build",
+  "evaluate", "investigate", "design", "verify",
+];
+
+export function inferExecutionComplexity(
+  request?: string,
+  intentRegistry?: IntentRegistry,
+  userKeywords?: UserKeywords,
+): "light" | "tracked" | "delegation" {
   const text = (request ?? "").trim();
+  const lower = text.toLowerCase();
 
-  // Short-circuit: trivial messages are always light
+  // Check user custom keywords first (highest priority — overrides all short-circuits)
+  if (userKeywords) {
+    for (const kw of userKeywords.delegation) {
+      if (lower.includes(kw.toLowerCase())) return "delegation";
+    }
+    for (const kw of userKeywords.light) {
+      if (lower.includes(kw.toLowerCase())) return "light";
+    }
+    for (const kw of userKeywords.tracked) {
+      if (lower.includes(kw.toLowerCase())) return "tracked";
+    }
+  }
+
+  // Short-circuit: trivial messages
   if (text.length < 15) return "light";
 
-  // Short-circuit: greetings and simple responses
+  // Short-circuit: greetings
   const trivialPatterns = [
-    /^(你好|hello|hi|hey|ok|好的|收到|谢谢|thanks|yes|no|是|不是|对|嗯)/i,
-    /^(帮我看|看一下|查一下)$/,
+    /^(你好|hello|hi|hey|ok|好的|收到|谢谢|thanks|yes|no|是|不是|对|嗯|可以|行|明白)/i,
   ];
   if (trivialPatterns.some((p) => p.test(text))) return "light";
 
-  const lower = text.toLowerCase();
-  const longTaskMarkers = [
-    // Chinese
-    "分步骤",
-    "按步骤",
-    "汇报进度",
-    "真实执行",
-    "下载",
-    "安装",
-    "部署",
-    "审计",
-    "检查",
-    "配置",
-    // English
-    "step by step",
-    "report progress",
-    "real execution",
-    "download",
-    "install",
-    "deploy",
-    "audit",
-    "inspect",
-    "check",
-    "configure",
-    "config",
-  ];
-  const delegationMarkers = [
-    // Chinese
-    "多 agent",
-    "子 agent",
-    "派",
-    "分工",
-    // English
-    "multi agent",
-    "multi-agent",
-    "subagent",
-    "sub-agent",
-    "delegate",
-    "dispatch",
-    "worker",
-  ];
-  const matchedLong = longTaskMarkers.filter((marker) => lower.includes(marker));
-  const matchedDelegation = delegationMarkers.filter((marker) => lower.includes(marker));
+  // Check learned patterns from intent registry
+  if (intentRegistry) {
+    const learnedTier = checkLearnedPatterns(lower, intentRegistry);
+    if (learnedTier) return learnedTier;
+  }
 
-  if (matchedDelegation.length > 0) {
+  // Static delegation markers (any one is enough)
+  if (DELEGATION_MARKERS.some((m) => lower.includes(m.toLowerCase()))) {
     return "delegation";
   }
-  if (matchedLong.length >= 2) {
-    return "tracked";
+
+  // Compound action detection: 3+ different action verbs → delegation
+  const matchedActions = ACTION_VERBS.filter((v) => lower.includes(v.toLowerCase()));
+  const uniqueActions = [...new Set(matchedActions)];
+  if (uniqueActions.length >= 3) {
+    return "delegation";
   }
-  if (matchedLong.length === 1 && text.length > 50) {
-    return "tracked";
+
+  // Structural detection: numbered list with 3+ items → delegation
+  const numberedItems = text.match(/(?:^|\n)\s*[0-9]+[.、)）]/gm);
+  if (numberedItems && numberedItems.length >= 3 && text.length > 80) {
+    return "delegation";
   }
+
+  // Tracked markers with compound evidence
+  const matchedTracked = TRACKED_MARKERS.filter((m) => lower.includes(m.toLowerCase()));
+  if (matchedTracked.length >= 2) return "tracked";
+  if (matchedTracked.length >= 1 && text.length > 50) return "tracked";
+
+  // 2 action verbs = tracked
+  if (uniqueActions.length >= 2) return "tracked";
+
+  // Long message (>100 chars) with 1 action verb = tracked
+  if (uniqueActions.length >= 1 && text.length > 100) return "tracked";
+
   return "light";
 }
 

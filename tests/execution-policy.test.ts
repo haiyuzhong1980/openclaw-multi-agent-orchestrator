@@ -6,6 +6,8 @@ import {
   shouldRequireDelegation,
   buildExecutionPolicyReport,
 } from "../src/execution-policy.ts";
+import { createEmptyRegistry, recordClassification } from "../src/intent-registry.ts";
+import type { UserKeywords } from "../src/user-keywords.ts";
 
 describe("inferExecutionComplexity", () => {
   it('returns delegation for Chinese "真实执行一个多 agent 调研"', () => {
@@ -140,6 +142,148 @@ describe("inferExecutionComplexity", () => {
     const text = "please check this item for me right now ok thanks!!"; // 51 chars
     assert.equal(text.length, 51);
     assert.equal(inferExecutionComplexity(text), "tracked");
+  });
+
+  // New: compound action verb detection
+  it("returns delegation for 3 action verbs in one message", () => {
+    assert.equal(inferExecutionComplexity("请帮我审计、评测和审查整个系统的安全性"), "delegation");
+  });
+
+  it("returns delegation for 3 English action verbs", () => {
+    assert.equal(inferExecutionComplexity("please audit, review and test the entire security system"), "delegation");
+  });
+
+  it("returns tracked for exactly 2 action verbs", () => {
+    const result = inferExecutionComplexity("audit and review the security module");
+    assert.equal(result, "tracked");
+  });
+
+  // New: numbered list detection
+  it("returns delegation for numbered list with 3+ items (> 80 chars)", () => {
+    const text = "Complete the following steps for our release pipeline:\n1. Set up the staging environment\n2. Run a smoke test suite\n3. Deploy to production servers";
+    assert.ok(text.length > 80, `Text length: ${text.length}`);
+    assert.equal(inferExecutionComplexity(text), "delegation");
+  });
+
+  it("returns delegation for numbered list with 3+ items using period", () => {
+    const text = "Complete the following:\n1. Deploy to production\n2. Run security audit\n3. Configure monitoring system and alerts";
+    assert.ok(text.length > 80, `Text length: ${text.length}`);
+    assert.equal(inferExecutionComplexity(text), "delegation");
+  });
+
+  it("does NOT return delegation for numbered list with only 2 items and simple verbs", () => {
+    const text = "Please complete the following steps carefully:\n1. Write the unit tests\n2. Submit a pull request when done";
+    const numberedItems = text.match(/(?:^|\n)\s*[0-9]+[.、)）]/gm);
+    assert.ok(numberedItems && numberedItems.length === 2, `Expected 2 items, got ${numberedItems?.length}`);
+    const result = inferExecutionComplexity(text);
+    assert.ok(result !== "delegation", `Expected not delegation, got ${result}`);
+  });
+
+  it("does NOT return delegation for numbered list with 3+ items but short text (< 80 chars)", () => {
+    const text = "1. do A\n2. do B\n3. do C";
+    assert.ok(text.length < 80);
+    const result = inferExecutionComplexity(text);
+    assert.ok(result !== "delegation", `Expected not delegation for short text, got ${result}`);
+  });
+
+  // New: user custom keywords override static detection (run before short-circuit)
+  it("user delegation keyword triggers delegation even for short message", () => {
+    const userKeywords: UserKeywords = {
+      delegation: ["全力推进"],
+      tracked: [],
+      light: [],
+      updatedAt: "",
+    };
+    // Short text (< 15 chars) but user keyword should still override
+    assert.equal(inferExecutionComplexity("全力推进", undefined, userKeywords), "delegation");
+  });
+
+  it("user tracked keyword triggers tracked", () => {
+    const userKeywords: UserKeywords = {
+      delegation: [],
+      tracked: ["出个报告"],
+      light: [],
+      updatedAt: "",
+    };
+    assert.equal(inferExecutionComplexity("出个报告", undefined, userKeywords), "tracked");
+  });
+
+  it("user light keyword overrides tracked detection", () => {
+    const userKeywords: UserKeywords = {
+      delegation: [],
+      tracked: [],
+      light: ["随便聊聊"],
+      updatedAt: "",
+    };
+    // Even with a tracked marker, light keyword should win (runs before short-circuit)
+    assert.equal(inferExecutionComplexity("随便聊聊", undefined, userKeywords), "light");
+  });
+
+  it("user delegation keyword takes precedence over static tracked detection", () => {
+    const userKeywords: UserKeywords = {
+      delegation: ["深度分析"],
+      tracked: [],
+      light: [],
+      updatedAt: "",
+    };
+    assert.equal(inferExecutionComplexity("深度分析", undefined, userKeywords), "delegation");
+  });
+
+  // New: learned patterns from intent registry
+  it("learned patterns boost delegation classification", () => {
+    const registry = createEmptyRegistry();
+    // Train "部署系统" as delegation 3 times
+    recordClassification(registry, ["部署系统"], "delegation");
+    recordClassification(registry, ["部署系统"], "delegation");
+    recordClassification(registry, ["部署系统"], "delegation");
+    // Text is >= 15 chars so it passes the length check and then hits the registry
+    const text = "这次需要把部署系统整体推上生产环境";
+    assert.ok(text.length >= 15, `Text length: ${text.length}`);
+    const result = inferExecutionComplexity(text, registry);
+    assert.equal(result, "delegation");
+  });
+
+  it("learned patterns with insufficient occurrences do not override", () => {
+    const registry = createEmptyRegistry();
+    // Only 2 occurrences — not enough
+    recordClassification(registry, ["deploy"], "delegation");
+    recordClassification(registry, ["deploy"], "delegation");
+    // Should fall through to static detection: "deploy" alone with short text → light
+    const result = inferExecutionComplexity("just deploy it", registry);
+    assert.equal(result, "light");
+  });
+
+  // New: delegation markers from expanded list (must be >= 15 chars)
+  it("returns delegation for 全力推进 marker", () => {
+    const text = "请帮我全力推进这个复杂系统改造项目";
+    assert.ok(text.length >= 15, `Text length: ${text.length}`);
+    assert.equal(inferExecutionComplexity(text), "delegation");
+  });
+
+  it("returns delegation for 全面推进 marker", () => {
+    const text = "需要你全面推进这个系统的改造和升级";
+    assert.ok(text.length >= 15, `Text length: ${text.length}`);
+    assert.equal(inferExecutionComplexity(text), "delegation");
+  });
+
+  it("returns delegation for orchestrate keyword", () => {
+    assert.equal(inferExecutionComplexity("orchestrate the deployment process"), "delegation");
+  });
+
+  it("returns delegation for parallel keyword", () => {
+    assert.equal(inferExecutionComplexity("run these tasks in parallel workers"), "delegation");
+  });
+
+  // New: light keyword overrides even delegation markers (user explicit light)
+  it("user light keyword beats delegation markers", () => {
+    const userKeywords: UserKeywords = {
+      delegation: [],
+      tracked: [],
+      light: ["multi agent"],
+      updatedAt: "",
+    };
+    // "multi agent" is a static delegation marker, but user says light
+    assert.equal(inferExecutionComplexity("this multi agent thing is light", undefined, userKeywords), "light");
   });
 });
 

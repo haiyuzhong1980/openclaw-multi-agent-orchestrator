@@ -22,6 +22,18 @@ import { processSubagentResult, isProjectReadyForReview } from "./src/result-col
 import { reviewProject, prepareRetries } from "./src/review-gate.ts";
 import { checkAndResume, buildResumePrompt } from "./src/session-resume.ts";
 import { generateProjectReport } from "./src/report-generator.ts";
+import { loadUserKeywords, saveUserKeywords, addUserKeyword } from "./src/user-keywords.ts";
+import type { UserKeywords } from "./src/user-keywords.ts";
+import {
+  loadIntentRegistry,
+  saveIntentRegistry,
+  extractIntentPhrases,
+  recordClassification,
+  recordCorrection,
+  detectCorrection,
+} from "./src/intent-registry.ts";
+import type { IntentRegistry } from "./src/intent-registry.ts";
+import { inferExecutionComplexity } from "./src/execution-policy.ts";
 
 const OFMS_SHARED_ROOT =
   process.env.OFMS_SHARED_ROOT ?? join(process.env.HOME ?? "", ".openclaw/shared-memory");
@@ -62,6 +74,27 @@ export default function register(api: OpenClawPluginApi) {
         saveBoard(OFMS_SHARED_ROOT, board);
       }
     }, 500);
+  }
+
+  // Self-evolving intent detection state
+  const userKeywords: UserKeywords = existsSync(OFMS_SHARED_ROOT)
+    ? loadUserKeywords(OFMS_SHARED_ROOT)
+    : { delegation: [], tracked: [], light: [], updatedAt: "" };
+
+  const intentRegistry: IntentRegistry = existsSync(OFMS_SHARED_ROOT)
+    ? loadIntentRegistry(OFMS_SHARED_ROOT)
+    : { patterns: {}, totalClassifications: 0, totalCorrections: 0, lastUpdated: new Date().toISOString(), version: 1 };
+
+  let lastClassification: { phrases: string[]; tier: "light" | "tracked" | "delegation"; timestamp: number } | null = null;
+
+  let intentRegistrySaveTimer: ReturnType<typeof setTimeout> | undefined;
+  function scheduleIntentRegistrySave(): void {
+    if (intentRegistrySaveTimer) clearTimeout(intentRegistrySaveTimer);
+    intentRegistrySaveTimer = setTimeout(() => {
+      if (existsSync(OFMS_SHARED_ROOT)) {
+        saveIntentRegistry(OFMS_SHARED_ROOT, intentRegistry);
+      }
+    }, 1000);
   }
 
   const tool = createMultiAgentOrchestratorTool({
@@ -117,6 +150,31 @@ export default function register(api: OpenClawPluginApi) {
       return { appendSystemContext: guidance };
     });
   }
+
+  api.on("message_received", async (event: Record<string, unknown>) => {
+    const text = (event.content as string | undefined)?.trim();
+    if (!text) return undefined;
+
+    // Extract phrases for intent learning
+    const phrases = extractIntentPhrases(text);
+
+    // Check if this is a correction of previous classification
+    if (lastClassification) {
+      const correction = detectCorrection(text, lastClassification.tier);
+      if (correction.isCorrection && correction.actualTier) {
+        recordCorrection(intentRegistry, lastClassification.phrases, lastClassification.tier, correction.actualTier);
+        api.logger.info(`[OMA] Intent correction detected: ${lastClassification.tier} → ${correction.actualTier}`);
+      }
+    }
+
+    // Record the current classification
+    const tier = inferExecutionComplexity(text, intentRegistry, userKeywords);
+    recordClassification(intentRegistry, phrases, tier);
+    lastClassification = { phrases, tier, timestamp: Date.now() };
+
+    scheduleIntentRegistrySave();
+    return undefined;
+  });
 
   api.on("before_tool_call", async (event: Record<string, unknown>) => {
     const blockReason = event.blockReason as string | undefined;
@@ -490,6 +548,89 @@ export default function register(api: OpenClawPluginApi) {
       const policyText = String(policy.content?.[0]?.text ?? "").trim();
       return {
         text: ["[maotest] plan", planText, "", "[maotest] merge", mergedText, "", "[maotest] policy", policyText].join("\n"),
+      };
+    },
+  });
+
+  api.registerCommand({
+    name: "mao-setup",
+    description: "Configure your personal multi-agent preferences",
+    handler: () => {
+      return {
+        text: [
+          "**OMA 个性化设置**",
+          "",
+          "请告诉我你的使用习惯，我会记住这些关键词来更好地理解你的意图：",
+          "",
+          "**1. 你通常怎么表达"帮我做复杂任务"？** (会触发多 agent 编排)",
+          "   例如: 全力推进、深度分析、全面审查...",
+          "   用 `/mao-keyword delegation <你的短语>` 添加",
+          "",
+          "**2. 你通常怎么表达"做个有步骤的任务"？** (会要求任务看板)",
+          "   例如: 按步骤来、出个报告、跑一遍流程...",
+          "   用 `/mao-keyword tracked <你的短语>` 添加",
+          "",
+          "**3. 有什么词你不希望触发编排？** (会保持简单对话)",
+          "   用 `/mao-keyword light <你的短语>` 添加",
+          "",
+          "当前已配置的自定义关键词:",
+          `  delegation: ${userKeywords.delegation.length > 0 ? userKeywords.delegation.join(", ") : "(无)"}`,
+          `  tracked: ${userKeywords.tracked.length > 0 ? userKeywords.tracked.join(", ") : "(无)"}`,
+          `  light: ${userKeywords.light.length > 0 ? userKeywords.light.join(", ") : "(无)"}`,
+        ].join("\n"),
+      };
+    },
+  });
+
+  api.registerCommand({
+    name: "mao-keyword",
+    description: "Add a custom keyword. Usage: /mao-keyword <delegation|tracked|light> <phrase>",
+    acceptsArgs: true,
+    handler: (ctx) => {
+      const args = (ctx.args ?? "").trim();
+      const spaceIdx = args.indexOf(" ");
+      if (spaceIdx < 0) return { text: "用法: /mao-keyword <delegation|tracked|light> <短语>" };
+      const tier = args.slice(0, spaceIdx) as "delegation" | "tracked" | "light";
+      const phrase = args.slice(spaceIdx + 1).trim();
+      if (!["delegation", "tracked", "light"].includes(tier)) {
+        return { text: "无效等级。使用: delegation, tracked, 或 light" };
+      }
+      addUserKeyword(userKeywords, tier, phrase);
+      if (existsSync(OFMS_SHARED_ROOT)) {
+        saveUserKeywords(OFMS_SHARED_ROOT, userKeywords);
+      }
+      return { text: `已添加 "${phrase}" 到 ${tier} 级别。` };
+    },
+  });
+
+  api.registerCommand({
+    name: "mao-learned",
+    description: "Show what OMA has learned about your intent patterns",
+    handler: () => {
+      const patterns = Object.values(intentRegistry.patterns)
+        .filter((p) => p.occurrences >= 2)
+        .sort((a, b) => b.occurrences - a.occurrences)
+        .slice(0, 20);
+
+      if (patterns.length === 0) return { text: "还没有学到足够的模式。多用几次就会开始学习。" };
+
+      const lines = patterns.map((p) => {
+        const topTier =
+          p.confidence.delegation > p.confidence.tracked && p.confidence.delegation > p.confidence.light
+            ? "delegation"
+            : p.confidence.tracked > p.confidence.light
+              ? "tracked"
+              : "light";
+        const topConf = Math.max(p.confidence.delegation, p.confidence.tracked, p.confidence.light);
+        return `"${p.phrase}" → ${topTier} (${(topConf * 100).toFixed(0)}%, seen ${p.occurrences}x)`;
+      });
+
+      return {
+        text: [
+          `OMA 已学习 ${Object.keys(intentRegistry.patterns).length} 个模式，${intentRegistry.totalCorrections} 次纠正`,
+          "",
+          ...lines,
+        ].join("\n"),
       };
     },
   });
