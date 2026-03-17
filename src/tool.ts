@@ -13,6 +13,14 @@ import { logEvent } from "./audit-log.ts";
 import type { TaskBoard } from "./task-board.ts";
 import { loadBoard, saveBoard, createProject, addTask } from "./task-board.ts";
 import { buildDispatchGuidance } from "./prompt-guidance.ts";
+import { runEvolutionCycle, appendEvolutionReport, formatEvolutionReport } from "./evolution-cycle.ts";
+import type { EvolutionReport } from "./evolution-cycle.ts";
+import { saveUserKeywords } from "./user-keywords.ts";
+import type { UserKeywords } from "./user-keywords.ts";
+import { saveIntentRegistry } from "./intent-registry.ts";
+import type { IntentRegistry } from "./intent-registry.ts";
+import { saveEnforcementState } from "./enforcement-ladder.ts";
+import type { EnforcementState } from "./enforcement-ladder.ts";
 
 export { MultiAgentOrchestratorSchema } from "./schema.ts";
 import { MultiAgentOrchestratorSchema } from "./schema.ts";
@@ -26,6 +34,12 @@ export function createMultiAgentOrchestratorTool(params?: {
   auditLog?: AuditLog;
   sharedRoot?: string;
   board?: TaskBoard;
+  // EV4: evolution cycle state
+  intentRegistry?: IntentRegistry;
+  userKeywords?: UserKeywords;
+  enforcementState?: EnforcementState;
+  existingDelegationKeywords?: string[];
+  existingTrackedKeywords?: string[];
 }) {
   const maxItemsPerTrack = Math.max(1, Math.min(20, params?.maxItemsPerTrack ?? 8));
   const executionPolicy: ExecutionPolicyMode = params?.executionPolicy ?? "guided";
@@ -229,6 +243,61 @@ export function createMultiAgentOrchestratorTool(params?: {
             projectId: project.id,
             tasks: project.tasks.map((t) => ({ id: t.id, label: t.label, trackId: t.trackId })),
           },
+        };
+      }
+
+      if (action === "evolve") {
+        const sharedRoot =
+          typeof rawParams.ofmsSharedRoot === "string"
+            ? rawParams.ofmsSharedRoot
+            : (params?.sharedRoot ?? "");
+
+        if (!sharedRoot) {
+          return {
+            content: [{ type: "text", text: "evolve requires sharedRoot or ofmsSharedRoot." }],
+          };
+        }
+
+        const intentRegistry = params?.intentRegistry ?? {
+          patterns: {},
+          totalClassifications: 0,
+          totalCorrections: 0,
+          lastUpdated: new Date().toISOString(),
+          version: 1,
+        };
+        const userKeywords = params?.userKeywords ?? { delegation: [], tracked: [], light: [], updatedAt: "" };
+        const enforcementState = params?.enforcementState ?? {
+          currentLevel: 0 as const,
+          levelHistory: [],
+          lastUpgrade: null,
+          lastDowngrade: null,
+          observationCount: 0,
+          correctionCount: 0,
+          consecutiveAccurateDays: 0,
+          installedAt: new Date().toISOString(),
+          version: 1,
+        };
+
+        const report = runEvolutionCycle({
+          sharedRoot,
+          intentRegistry,
+          userKeywords,
+          enforcementState,
+          existingDelegationKeywords: params?.existingDelegationKeywords ?? [],
+          existingTrackedKeywords: params?.existingTrackedKeywords ?? [],
+        });
+
+        // Persist updated state
+        saveUserKeywords(sharedRoot, userKeywords);
+        saveIntentRegistry(sharedRoot, intentRegistry);
+        saveEnforcementState(sharedRoot, enforcementState);
+        appendEvolutionReport(sharedRoot, report);
+
+        log?.(`[tool] action=evolve applied=${report.autoApplied.length} pending=${report.pendingReview.length}`);
+
+        return {
+          content: [{ type: "text", text: formatEvolutionReport(report) }],
+          details: report,
         };
       }
 

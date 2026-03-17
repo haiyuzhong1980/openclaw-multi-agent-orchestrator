@@ -4,7 +4,7 @@ export const MultiAgentOrchestratorSchema = {
   properties: {
     action: {
       type: "string",
-      enum: ["plan_tracks", "validate_and_merge", "enforce_execution_policy", "orchestrate"],
+      enum: ["plan_tracks", "validate_and_merge", "enforce_execution_policy", "orchestrate", "evolve"],
       description: "Operation to perform.",
     },
     request: {

@@ -1,5 +1,5 @@
 import { join } from "node:path";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { Type } from "@sinclair/typebox";
 import type { AnyAgentTool, OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { createMultiAgentOrchestratorTool, MultiAgentOrchestratorSchema } from "./src/tool.ts";
@@ -34,6 +34,45 @@ import {
 } from "./src/intent-registry.ts";
 import type { IntentRegistry } from "./src/intent-registry.ts";
 import { inferExecutionComplexity } from "./src/execution-policy.ts";
+import {
+  createObservation,
+  appendObservation,
+  updateObservationOutcome,
+  updateObservationFeedback,
+  detectFeedbackSignal,
+  flushBuffer,
+  loadRecentObservations,
+  computeStats,
+} from "./src/observation-engine.ts";
+import { discoverPatterns, formatDiscoveryReport } from "./src/pattern-discovery.ts";
+import {
+  loadEnforcementState,
+  saveEnforcementState,
+  getEnforcementBehavior,
+  evaluateAndAdjust,
+  formatEnforcementStatus,
+  createDefaultState,
+} from "./src/enforcement-ladder.ts";
+import {
+  runEvolutionCycle,
+  appendEvolutionReport,
+  loadEvolutionHistory,
+  formatEvolutionReport,
+} from "./src/evolution-cycle.ts";
+import {
+  loadOnboardingState,
+  saveOnboardingState,
+  needsOnboarding,
+  generateWelcomeMessage,
+  processOnboardingResponse,
+} from "./src/onboarding.ts";
+import type { OnboardingState } from "./src/onboarding.ts";
+import {
+  exportPatterns,
+  importPatterns,
+  serializeExport,
+  parseImport,
+} from "./src/pattern-export.ts";
 
 const OFMS_SHARED_ROOT =
   process.env.OFMS_SHARED_ROOT ?? join(process.env.HOME ?? "", ".openclaw/shared-memory");
@@ -86,6 +125,7 @@ export default function register(api: OpenClawPluginApi) {
     : { patterns: {}, totalClassifications: 0, totalCorrections: 0, lastUpdated: new Date().toISOString(), version: 1 };
 
   let lastClassification: { phrases: string[]; tier: "light" | "tracked" | "delegation"; timestamp: number } | null = null;
+  let currentObservationId: string | null = null;
 
   let intentRegistrySaveTimer: ReturnType<typeof setTimeout> | undefined;
   function scheduleIntentRegistrySave(): void {
@@ -96,6 +136,15 @@ export default function register(api: OpenClawPluginApi) {
       }
     }, 1000);
   }
+
+  // EV3: Progressive enforcement ladder state
+  let enforcementState = loadEnforcementState(OFMS_SHARED_ROOT);
+
+  // EV5: Onboarding state
+  let onboardingState: OnboardingState = existsSync(OFMS_SHARED_ROOT)
+    ? loadOnboardingState(OFMS_SHARED_ROOT)
+    : { completed: false, userProfile: { customPhrases: [] } };
+  let onboardingMessageSent = false;
 
   const tool = createMultiAgentOrchestratorTool({
     executionPolicy,
@@ -120,6 +169,17 @@ export default function register(api: OpenClawPluginApi) {
 
   if (pluginConfig.enabledPromptGuidance !== false) {
     api.on("before_prompt_build", async () => {
+      // EV5: Onboarding — show welcome on first call for new users
+      if (needsOnboarding(onboardingState) && !onboardingMessageSent) {
+        onboardingMessageSent = true;
+        return { prependSystemContext: generateWelcomeMessage(onboardingState) };
+      }
+
+      const behavior = getEnforcementBehavior(enforcementState.currentLevel);
+
+      // Level 0: silent — no guidance injection
+      if (!behavior.injectGuidance) return undefined;
+
       let guidance = buildOrchestratorPromptGuidance(executionPolicy);
       if (existsSync(OFMS_SHARED_ROOT)) {
         guidance +=
@@ -137,14 +197,21 @@ export default function register(api: OpenClawPluginApi) {
         }
       }
 
-      // Inject dispatch guidance for active projects with pending tasks
-      const activeProjects = getActiveProjects(board);
-      if (activeProjects.length > 0) {
-        const project = activeProjects[activeProjects.length - 1];
-        const dispatchGuidance = buildDispatchGuidance(project);
-        if (dispatchGuidance) {
-          guidance += dispatchGuidance;
+      // Inject dispatch guidance for active projects with pending tasks (Level 2+)
+      if (behavior.injectDispatchPlan) {
+        const activeProjects = getActiveProjects(board);
+        if (activeProjects.length > 0) {
+          const project = activeProjects[activeProjects.length - 1];
+          const dispatchGuidance = buildDispatchGuidance(project);
+          if (dispatchGuidance) {
+            guidance += dispatchGuidance;
+          }
         }
+      }
+
+      // Level 1 soft advisory message
+      if (behavior.advisoryMessage) {
+        guidance += "\n" + behavior.advisoryMessage;
       }
 
       return { appendSystemContext: guidance };
@@ -154,6 +221,24 @@ export default function register(api: OpenClawPluginApi) {
   api.on("message_received", async (event: Record<string, unknown>) => {
     const text = (event.content as string | undefined)?.trim();
     if (!text) return undefined;
+
+    // EV5: Process onboarding response if onboarding not yet completed
+    if (!onboardingState.completed && /^[1-3][a-e]/i.test(text)) {
+      const result = processOnboardingResponse({
+        response: text,
+        onboardingState,
+        userKeywords,
+        enforcementState,
+      });
+      if (result.configured) {
+        if (existsSync(OFMS_SHARED_ROOT)) {
+          saveOnboardingState(OFMS_SHARED_ROOT, onboardingState);
+          saveUserKeywords(OFMS_SHARED_ROOT, userKeywords);
+          saveEnforcementState(OFMS_SHARED_ROOT, enforcementState);
+        }
+        api.logger.info(`[OMA] Onboarding complete: level=${result.initialLevel}, keywords=${result.keywordsAdded.length}`);
+      }
+    }
 
     // Extract phrases for intent learning
     const phrases = extractIntentPhrases(text);
@@ -167,10 +252,30 @@ export default function register(api: OpenClawPluginApi) {
       }
     }
 
+    // Check if this message is feedback on the previous observation
+    if (currentObservationId && lastClassification && existsSync(OFMS_SHARED_ROOT)) {
+      const feedback = detectFeedbackSignal(text, lastClassification.tier);
+      updateObservationFeedback(OFMS_SHARED_ROOT, currentObservationId, {
+        userFollowUp: feedback.type,
+        actualTier: feedback.actualTier,
+      });
+    }
+
     // Record the current classification
     const tier = inferExecutionComplexity(text, intentRegistry, userKeywords);
     recordClassification(intentRegistry, phrases, tier);
     lastClassification = { phrases, tier, timestamp: Date.now() };
+
+    // Create new observation
+    if (existsSync(OFMS_SHARED_ROOT)) {
+      const obs = createObservation({
+        message: text,
+        agent: (event.channelId as string | undefined) ?? "unknown",
+        predictedTier: tier,
+      });
+      appendObservation(OFMS_SHARED_ROOT, obs);
+      currentObservationId = obs.id;
+    }
 
     scheduleIntentRegistrySave();
     return undefined;
@@ -180,6 +285,30 @@ export default function register(api: OpenClawPluginApi) {
     const blockReason = event.blockReason as string | undefined;
     if (blockReason) {
       logEvent(auditLog, "tool_blocked", { toolName: event.toolName, reason: blockReason });
+    }
+
+    const behavior = getEnforcementBehavior(enforcementState.currentLevel);
+    if (!behavior.blockNonDispatchTools) {
+      // Level 0, 1, 2: don't block, just log
+      if (behavior.logOnly) return undefined; // Level 0: silent
+      // Level 1, 2: log but allow
+      return undefined;
+    }
+    // Level 3: existing hard block logic is handled by the tool itself via blockReason above
+
+    return undefined;
+  });
+
+  api.on("after_tool_call", async (event: Record<string, unknown>) => {
+    if (currentObservationId && existsSync(OFMS_SHARED_ROOT)) {
+      const toolName = event.toolName as string | undefined;
+      if (toolName) {
+        updateObservationOutcome(OFMS_SHARED_ROOT, currentObservationId, {
+          toolsCalled: [toolName],
+          didSpawnSubagent: toolName === "sessions_spawn",
+          spawnCount: toolName === "sessions_spawn" ? 1 : 0,
+        });
+      }
     }
     return undefined;
   });
@@ -554,31 +683,14 @@ export default function register(api: OpenClawPluginApi) {
 
   api.registerCommand({
     name: "mao-setup",
-    description: "Configure your personal multi-agent preferences",
+    description: "Configure OMA preferences (re-run onboarding)",
     handler: () => {
-      return {
-        text: [
-          "**OMA 个性化设置**",
-          "",
-          "请告诉我你的使用习惯，我会记住这些关键词来更好地理解你的意图：",
-          "",
-          "**1. 你通常怎么表达"帮我做复杂任务"？** (会触发多 agent 编排)",
-          "   例如: 全力推进、深度分析、全面审查...",
-          "   用 `/mao-keyword delegation <你的短语>` 添加",
-          "",
-          "**2. 你通常怎么表达"做个有步骤的任务"？** (会要求任务看板)",
-          "   例如: 按步骤来、出个报告、跑一遍流程...",
-          "   用 `/mao-keyword tracked <你的短语>` 添加",
-          "",
-          "**3. 有什么词你不希望触发编排？** (会保持简单对话)",
-          "   用 `/mao-keyword light <你的短语>` 添加",
-          "",
-          "当前已配置的自定义关键词:",
-          `  delegation: ${userKeywords.delegation.length > 0 ? userKeywords.delegation.join(", ") : "(无)"}`,
-          `  tracked: ${userKeywords.tracked.length > 0 ? userKeywords.tracked.join(", ") : "(无)"}`,
-          `  light: ${userKeywords.light.length > 0 ? userKeywords.light.join(", ") : "(无)"}`,
-        ].join("\n"),
-      };
+      onboardingState.completed = false;
+      if (existsSync(OFMS_SHARED_ROOT)) {
+        saveOnboardingState(OFMS_SHARED_ROOT, onboardingState);
+      }
+      onboardingMessageSent = false;
+      return { text: generateWelcomeMessage(onboardingState) };
     },
   });
 
@@ -633,6 +745,171 @@ export default function register(api: OpenClawPluginApi) {
         ].join("\n"),
       };
     },
+  });
+
+  api.registerCommand({
+    name: "mao-observations",
+    description: "Show observation statistics and learning progress",
+    handler: () => {
+      const recent = loadRecentObservations(OFMS_SHARED_ROOT, 24 * 7); // last 7 days
+      const stats = computeStats(recent);
+      return {
+        text: JSON.stringify(
+          {
+            totalObservations: stats.totalObservations,
+            last24h: stats.last24h,
+            last7d: stats.last7d,
+            accuracy: `${(stats.accuracy * 100).toFixed(1)}%`,
+            correctionRate: `${(stats.correctionRate * 100).toFixed(1)}%`,
+            tierDistribution: stats.tierDistribution,
+          },
+          null,
+          2,
+        ),
+      };
+    },
+  });
+
+  api.registerCommand({
+    name: "mao-discover",
+    description: "Run pattern discovery on recent observations",
+    handler: () => {
+      const observations = loadRecentObservations(OFMS_SHARED_ROOT, 24 * 30); // last 30 days
+      if (observations.length < 10) {
+        return {
+          text: `Not enough observations yet (${observations.length}/10). Keep using OMA and patterns will emerge.`,
+        };
+      }
+      const result = discoverPatterns(
+        observations,
+        [], // TODO: pass current delegation keywords
+        [], // TODO: pass current tracked keywords
+      );
+      return { text: formatDiscoveryReport(result) };
+    },
+  });
+
+  api.registerCommand({
+    name: "mao-level",
+    description: "Show current enforcement level and upgrade/downgrade progress",
+    handler: () => {
+      const stats = computeStats(loadRecentObservations(OFMS_SHARED_ROOT, 24 * 7));
+      return { text: formatEnforcementStatus(enforcementState, stats) };
+    },
+  });
+
+  api.registerCommand({
+    name: "mao-reset",
+    description: "Reset OMA to Level 0 (restart observation phase)",
+    handler: () => {
+      enforcementState = createDefaultState();
+      saveEnforcementState(OFMS_SHARED_ROOT, enforcementState);
+      return { text: "OMA reset to Level 0. Observation phase restarted." };
+    },
+  });
+
+  api.registerCommand({
+    name: "mao-export",
+    description: "Export learned patterns to a shareable file",
+    handler: () => {
+      const exported = exportPatterns({
+        intentRegistry,
+        userKeywords,
+        enforcementState,
+        observations: loadRecentObservations(OFMS_SHARED_ROOT, 24 * 30),
+      });
+      const json = serializeExport(exported);
+      const filePath = join(OFMS_SHARED_ROOT, `oma-patterns-export-${new Date().toISOString().slice(0, 10)}.json`);
+      writeFileSync(filePath, json, "utf-8");
+      return {
+        text: `Patterns exported to: ${filePath}\nPatterns: ${Object.keys(exported.intentPatterns).length}, Keywords: ${exported.userKeywords.delegation.length + exported.userKeywords.tracked.length}`,
+      };
+    },
+  });
+
+  api.registerCommand({
+    name: "mao-import",
+    description: "Import patterns from a shared file. Usage: /mao-import <filepath>",
+    acceptsArgs: true,
+    handler: (ctx) => {
+      const filePath = (ctx.args ?? "").trim();
+      if (!filePath) return { text: "Usage: /mao-import <filepath>" };
+      try {
+        const json = readFileSync(filePath, "utf-8");
+        const exported = parseImport(json);
+        if (!exported) return { text: "Invalid export file format." };
+        const result = importPatterns({ exported, intentRegistry, userKeywords });
+        if (existsSync(OFMS_SHARED_ROOT)) {
+          saveIntentRegistry(OFMS_SHARED_ROOT, intentRegistry);
+          saveUserKeywords(OFMS_SHARED_ROOT, userKeywords);
+        }
+        return { text: `Imported ${result.patternsImported} patterns and ${result.keywordsImported} keywords.` };
+      } catch (e) {
+        return { text: `Import failed: ${String(e)}` };
+      }
+    },
+  });
+
+
+  api.registerCommand({
+    name: "mao-evolve",
+    description: "Manually trigger an evolution cycle",
+    handler: () => {
+      const report = runEvolutionCycle({
+        sharedRoot: OFMS_SHARED_ROOT,
+        intentRegistry,
+        userKeywords,
+        enforcementState,
+        existingDelegationKeywords: [],
+        existingTrackedKeywords: [],
+      });
+      saveUserKeywords(OFMS_SHARED_ROOT, userKeywords);
+      saveIntentRegistry(OFMS_SHARED_ROOT, intentRegistry);
+      saveEnforcementState(OFMS_SHARED_ROOT, enforcementState);
+      appendEvolutionReport(OFMS_SHARED_ROOT, report);
+      return { text: formatEvolutionReport(report) };
+    },
+  });
+
+  api.registerCommand({
+    name: "mao-evolution-history",
+    description: "Show past evolution reports",
+    handler: () => {
+      const history = loadEvolutionHistory(OFMS_SHARED_ROOT);
+      if (history.length === 0) return { text: "No evolution cycles have run yet." };
+      const recent = history.slice(-5);
+      return { text: recent.map((r) => formatEvolutionReport(r)).join("\n---\n") };
+    },
+  });
+
+  // EV4: Periodic evolution cycle — once per 24 hours
+  let lastEvolutionDate = "";
+  const evolutionTimer = setInterval(() => {
+    const today = new Date().toISOString().slice(0, 10);
+    if (today !== lastEvolutionDate) {
+      const report = runEvolutionCycle({
+        sharedRoot: OFMS_SHARED_ROOT,
+        intentRegistry,
+        userKeywords,
+        enforcementState,
+        existingDelegationKeywords: [],
+        existingTrackedKeywords: [],
+      });
+      lastEvolutionDate = today;
+      if (report.autoApplied.length > 0 || report.enforcementLevelBefore !== report.enforcementLevelAfter) {
+        api.logger.info(`[OMA Evolution] ${report.summary}`);
+        saveUserKeywords(OFMS_SHARED_ROOT, userKeywords);
+        saveEnforcementState(OFMS_SHARED_ROOT, enforcementState);
+        appendEvolutionReport(OFMS_SHARED_ROOT, report);
+      }
+    }
+  }, 60 * 60 * 1000); // check every hour
+  evolutionTimer.unref?.(); // don't block process exit
+
+  // Flush observation buffer on service stop
+  process.on("exit", () => {
+    flushBuffer(OFMS_SHARED_ROOT);
+    saveEnforcementState(OFMS_SHARED_ROOT, enforcementState);
   });
 
   api.registerCli(
