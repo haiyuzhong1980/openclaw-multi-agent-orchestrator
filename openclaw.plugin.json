@@ -1,0 +1,52 @@
+{
+  "id": "multi-agent-orchestrator",
+  "author": "haiyuzhong1980",
+  "name": "Multi-Agent Orchestrator",
+  "description": "Deterministic validation and merge helper for multi-agent research tasks.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabledPromptGuidance": {
+        "type": "boolean"
+      },
+      "maxItemsPerTrack": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 20
+      },
+      "executionPolicy": {
+        "type": "string",
+        "enum": [
+          "free",
+          "guided",
+          "tracked",
+          "delegation-first",
+          "strict-orchestrated"
+        ]
+      },
+      "delegationStartGate": {
+        "type": "string",
+        "enum": [
+          "off",
+          "advisory",
+          "required"
+        ]
+      }
+    }
+  },
+  "uiHints": {
+    "enabledPromptGuidance": {
+      "label": "Enable Prompt Guidance"
+    },
+    "maxItemsPerTrack": {
+      "label": "Max Items Per Track"
+    },
+    "executionPolicy": {
+      "label": "Execution Policy"
+    },
+    "delegationStartGate": {
+      "label": "Delegation Start Gate"
+    }
+  }
+}
