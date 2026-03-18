@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import type { AnyAgentTool, OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { createMultiAgentOrchestratorTool, MultiAgentOrchestratorSchema } from "./src/tool.ts";
-import { buildOrchestratorPromptGuidance, buildDispatchGuidance } from "./src/prompt-guidance.ts";
+import { buildOrchestratorPromptGuidance, buildDispatchGuidance, buildDelegationMandate } from "./src/prompt-guidance.ts";
 import { loadAgentRegistry, searchAgents, getAgentsByCategory } from "./src/agent-registry.ts";
 import { listTemplates, findTemplate } from "./src/track-templates.ts";
 import { createAuditLog, logEvent, formatAuditReport } from "./src/audit-log.ts";
@@ -126,6 +126,9 @@ export default function register(api: OpenClawPluginApi) {
   let lastClassification: { phrases: string[]; tier: "light" | "tracked" | "delegation"; timestamp: number } | null = null;
   let currentObservationId: string | null = null;
 
+  // L1: 自动编排 — 当检测到 delegation tier 时，记录请求，在下次 prompt build 时注入强制指令
+  let pendingDelegationRequest: string | null = null;
+
   let intentRegistrySaveTimer: ReturnType<typeof setTimeout> | undefined;
   function scheduleIntentRegistrySave(): void {
     if (intentRegistrySaveTimer) clearTimeout(intentRegistrySaveTimer);
@@ -210,6 +213,21 @@ export default function register(api: OpenClawPluginApi) {
         guidance += "\n" + behavior.advisoryMessage;
       }
 
+      // L1: 当检测到 delegation tier 时，注入强制编排指令
+      if (pendingDelegationRequest) {
+        const agentNames = (() => {
+          try {
+            const registry = loadAgentRegistry();
+            return registry.agents.map((a) => `${a.name} (${a.category}): ${a.description?.slice(0, 60) ?? ""}`);
+          } catch {
+            return undefined;
+          }
+        })();
+        guidance += buildDelegationMandate(pendingDelegationRequest, agentNames);
+        api.logger.info(`[OMA/L1] Delegation mandate injected for: ${pendingDelegationRequest.slice(0, 80)}`);
+        // 不清空 pendingDelegationRequest — 让它在整个对话轮次中保持，直到下一条消息覆盖
+      }
+
       return { appendSystemContext: guidance };
     });
   }
@@ -261,6 +279,14 @@ export default function register(api: OpenClawPluginApi) {
     const tier = inferExecutionComplexity(text, intentRegistry, userKeywords);
     recordClassification(intentRegistry, phrases, tier);
     lastClassification = { phrases, tier, timestamp: Date.now() };
+
+    // L1: 当检测到 delegation tier，记录请求以便 before_prompt_build 注入强制指令
+    if (tier === "delegation") {
+      pendingDelegationRequest = text;
+      api.logger.info(`[OMA/L1] Delegation detected, will inject mandate on next prompt build`);
+    } else {
+      pendingDelegationRequest = null;
+    }
 
     // Create new observation
     if (existsSync(OFMS_SHARED_ROOT)) {

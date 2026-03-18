@@ -20,6 +20,54 @@ export function buildOrchestratorPromptGuidance(mode: ExecutionPolicyMode): stri
   ].join("\n");
 }
 
+/**
+ * L1 强制编排指令 — 当消息被分类为 delegation 时注入。
+ * 不 block 任何工具，但把"该怎么做"喂到嘴里，让 agent 大概率照做。
+ */
+export function buildDelegationMandate(request: string, availableAgents?: string[]): string {
+  const lines = [
+    "",
+    "══════════════════════════════════════════",
+    "DELEGATION MODE — 当前任务需要多 agent 协作",
+    "══════════════════════════════════════════",
+    "",
+    "你是编排者（orchestrator），不是执行者（executor）。",
+    "当前用户消息已被系统识别为需要派遣子 agent 的任务。",
+    "",
+    "你必须按以下顺序操作，不要跳步：",
+    "",
+    "Step 1: 分析任务，拆分为 2-5 个可并行的子任务",
+    "Step 2: 调用 multi-agent-orchestrator tool，action=orchestrate，request=用户原始请求",
+    "        这会在 task board 上创建项目和任务",
+    "Step 3: 对每个子任务，调用 Agent tool 派出子 agent（可并行派出多个）",
+    '        示例：Agent({ prompt: "子任务描述", subagent_type: "executor" })',
+    "Step 4: 收集所有子 agent 的结果",
+    "Step 5: 调用 multi-agent-orchestrator tool，action=validate_and_merge 验收",
+    "Step 6: 汇总输出最终报告给用户",
+    "",
+    "禁止行为：",
+    "- 不要自己直接写代码、改文件、跑命令来完成实质工作",
+    "- 不要跳过 Step 2-3 直接给出结果",
+    "- 不要把所有工作放在一个 agent 里（除非任务确实不可拆分）",
+    "",
+    `用户原始请求：「${request.slice(0, 300)}」`,
+  ];
+
+  if (availableAgents && availableAgents.length > 0) {
+    lines.push("");
+    lines.push("可用的子 agent 类型：");
+    for (const agent of availableAgents.slice(0, 12)) {
+      lines.push(`  - ${agent}`);
+    }
+  }
+
+  lines.push("");
+  lines.push("══════════════════════════════════════════");
+  lines.push("");
+
+  return lines.join("\n");
+}
+
 export function buildDispatchGuidance(project: Project): string {
   const pendingTasks = project.tasks.filter((t) => t.status === "pending");
   if (pendingTasks.length === 0) return "";
