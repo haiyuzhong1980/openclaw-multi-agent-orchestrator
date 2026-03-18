@@ -198,7 +198,7 @@ describe("runEvolutionCycle: with enough observations", () => {
 // runEvolutionCycle — enforcement downgrade
 // ---------------------------------------------------------------------------
 describe("runEvolutionCycle: enforcement downgrade on corrections", () => {
-  it("downgrades enforcement when many corrections in 24h", () => {
+  it("downgrades enforcement after consecutive days exceeding threshold", () => {
     const dir = makeTmpDir();
     // Write 25 observations, majority with corrections in last 24h
     for (let i = 0; i < 25; i++) {
@@ -206,12 +206,16 @@ describe("runEvolutionCycle: enforcement downgrade on corrections", () => {
       const backDated: ObservationRecord = {
         ...obs,
         timestamp: new Date(Date.now() - i * 60000).toISOString(), // within 24h
-        userFollowUp: i < 5 ? "corrected_down" : "satisfied",
-        actualTier: i < 5 ? "light" : "delegation",
+        userFollowUp: i < 6 ? "corrected_down" : "satisfied",
+        actualTier: i < 6 ? "light" : "delegation",
       };
       appendObservation(dir, backDated);
     }
-    const state: EnforcementState = { ...createDefaultState(), currentLevel: 3 };
+    const state: EnforcementState = {
+      ...createDefaultState(),
+      currentLevel: 3,
+      consecutiveDowngradeDays: 1, // already had 1 bad day — this is day 2
+    };
     const report = runEvolutionCycle({
       sharedRoot: dir,
       intentRegistry: makeEmptyRegistry(),
@@ -220,7 +224,7 @@ describe("runEvolutionCycle: enforcement downgrade on corrections", () => {
       existingDelegationKeywords: [],
       existingTrackedKeywords: [],
     });
-    // 5 corrections in 24h at level 3 → downgrade to 2
+    // 6 corrections in 24h + 2nd consecutive day → downgrade to 2
     assert.equal(report.enforcementLevelBefore, 3);
     assert.equal(report.enforcementLevelAfter, 2);
   });

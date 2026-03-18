@@ -48,7 +48,7 @@ export function createEmptyRegistry(): IntentRegistry {
     patterns: {},
     totalClassifications: 0,
     totalCorrections: 0,
-    lastUpdated: new Date().toISOString(),
+    lastUpdated: new Date(Date.now()).toISOString(),
     version: 1,
   };
 }
@@ -149,7 +149,7 @@ export function recordClassification(
       if (predictedTier === "delegation") existing.delegationCount++;
       else if (predictedTier === "tracked") existing.trackedCount++;
       else existing.lightCount++;
-      existing.lastSeen = new Date().toISOString();
+      existing.lastSeen = new Date(Date.now()).toISOString();
       recalculateConfidence(existing);
     } else {
       const newPattern: IntentPattern = {
@@ -158,7 +158,7 @@ export function recordClassification(
         delegationCount: predictedTier === "delegation" ? 1 : 0,
         trackedCount: predictedTier === "tracked" ? 1 : 0,
         lightCount: predictedTier === "light" ? 1 : 0,
-        lastSeen: new Date().toISOString(),
+        lastSeen: new Date(Date.now()).toISOString(),
         confidence: { delegation: 0, tracked: 0, light: 0 },
       };
       recalculateConfidence(newPattern);

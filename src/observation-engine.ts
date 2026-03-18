@@ -128,7 +128,7 @@ export function createObservation(params: {
   const { message, agent, predictedTier } = params;
   return {
     id: generateObservationId(),
-    timestamp: new Date().toISOString(),
+    timestamp: new Date(Date.now()).toISOString(),
     agent,
     messageText: message.slice(0, 200),
     messageLength: message.length,

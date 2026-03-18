@@ -1,0 +1,58 @@
+version: "3.8"
+
+services:
+  # OMA 自进化模拟器 — 纯函数级测试，不需要完整 OpenClaw
+  oma-simulator:
+    build:
+      context: ../..
+      dockerfile: tests/simulation/Dockerfile
+    container_name: oma-sim
+    volumes:
+      - sim-output:/root/.openclaw/shared-memory/simulation-runs
+    environment:
+      - TOTAL_DAYS=${TOTAL_DAYS:-30}
+      - MESSAGES_PER_DAY=${MESSAGES_PER_DAY:-40}
+    command:
+      - tests/simulation/simulate-days.ts
+      - --days
+      - "${TOTAL_DAYS:-30}"
+      - --messages-per-day
+      - "${MESSAGES_PER_DAY:-40}"
+      - --verbose
+      - --output-dir
+      - /root/.openclaw/shared-memory/simulation-runs/current
+
+  # 可选: 本地小模型用于生成多样化消息（Phase 2）
+  # 当前版本用模板消息，后续可接入 LLM 生成更真实的消息
+  #
+  # local-llm:
+  #   image: ollama/ollama:latest
+  #   container_name: oma-llm
+  #   ports:
+  #     - "11434:11434"
+  #   volumes:
+  #     - ollama-data:/root/.ollama
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         memory: 2G
+
+  # 分析报告生成
+  analyzer:
+    build:
+      context: ../..
+      dockerfile: tests/simulation/Dockerfile
+    container_name: oma-analyzer
+    depends_on:
+      oma-simulator:
+        condition: service_completed_successfully
+    volumes:
+      - sim-output:/root/.openclaw/shared-memory/simulation-runs
+    entrypoint: ["node", "--experimental-strip-types"]
+    command:
+      - tests/simulation/analyze-results.ts
+      - /root/.openclaw/shared-memory/simulation-runs/current/simulation-report.json
+
+volumes:
+  sim-output:
+  # ollama-data:

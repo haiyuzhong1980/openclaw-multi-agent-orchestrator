@@ -132,26 +132,26 @@ describe("shouldUpgrade", () => {
     assert.equal(result.upgrade, false);
   });
 
-  it("1→2 when accuracy reaches 70%", () => {
+  it("1→2 when accuracy reaches 75%", () => {
     const state: EnforcementState = { ...createDefaultState(), currentLevel: 1 };
-    const stats = makeStats({ totalObservations: 50, accuracy: 0.70 });
+    const stats = makeStats({ totalObservations: 50, accuracy: 0.75 });
     const result = shouldUpgrade(state, stats);
     assert.equal(result.upgrade, true);
     assert.equal(result.newLevel, 2);
   });
 
-  it("1→2 not triggered below 70% accuracy", () => {
+  it("1→2 not triggered below 75% accuracy", () => {
     const state: EnforcementState = { ...createDefaultState(), currentLevel: 1 };
-    const stats = makeStats({ totalObservations: 50, accuracy: 0.69 });
+    const stats = makeStats({ totalObservations: 50, accuracy: 0.74 });
     const result = shouldUpgrade(state, stats);
     assert.equal(result.upgrade, false);
   });
 
-  it("2→3 when accuracy ≥ 85% and 3 consecutive accurate days", () => {
+  it("2→3 when accuracy ≥ 85% and 5 consecutive accurate days", () => {
     const state: EnforcementState = {
       ...createDefaultState(),
       currentLevel: 2,
-      consecutiveAccurateDays: 3,
+      consecutiveAccurateDays: 5,
     };
     const stats = makeStats({ totalObservations: 100, accuracy: 0.85 });
     const result = shouldUpgrade(state, stats);
@@ -159,11 +159,11 @@ describe("shouldUpgrade", () => {
     assert.equal(result.newLevel, 3);
   });
 
-  it("2→3 not triggered when accuracy is high but days < 3", () => {
+  it("2→3 not triggered when accuracy is high but days < 5", () => {
     const state: EnforcementState = {
       ...createDefaultState(),
       currentLevel: 2,
-      consecutiveAccurateDays: 2,
+      consecutiveAccurateDays: 4,
     };
     const stats = makeStats({ totalObservations: 100, accuracy: 0.90 });
     const result = shouldUpgrade(state, stats);
@@ -197,16 +197,16 @@ describe("shouldUpgrade", () => {
 // shouldDowngrade
 // ---------------------------------------------------------------------------
 describe("shouldDowngrade", () => {
-  it("Level 3 downgrades to 2 when 3+ corrections in 24h", () => {
+  it("Level 3 downgrades to 2 when 5+ corrections in 24h", () => {
     const state: EnforcementState = { ...createDefaultState(), currentLevel: 3 };
-    const result = shouldDowngrade(state, 3, 0);
+    const result = shouldDowngrade(state, 5, 0);
     assert.equal(result.downgrade, true);
     assert.equal(result.newLevel, 2);
   });
 
-  it("Level 3 does not downgrade with only 2 corrections in 24h", () => {
+  it("Level 3 does not downgrade with only 4 corrections in 24h", () => {
     const state: EnforcementState = { ...createDefaultState(), currentLevel: 3 };
-    const result = shouldDowngrade(state, 2, 0);
+    const result = shouldDowngrade(state, 4, 0);
     assert.equal(result.downgrade, false);
   });
 
@@ -289,19 +289,23 @@ describe("evaluateAndAdjust", () => {
     assert.equal(state.currentLevel, 1);
   });
 
-  it("downgrades when errors — full cycle", () => {
+  it("downgrades when errors exceed buffer — full cycle", () => {
     const state: EnforcementState = { ...createDefaultState(), currentLevel: 3 };
     const stats = makeStats({ totalObservations: 50, accuracy: 0.5 });
-    // 3 corrections in 24h triggers downgrade from 3 → 2
-    const result = evaluateAndAdjust(state, stats, 3);
-    assert.equal(result.changed, true);
-    assert.equal(result.oldLevel, 3);
-    assert.equal(result.newLevel, 2);
+    // Day 1: 5 corrections → buffer day 1, no change yet
+    const r1 = evaluateAndAdjust(state, stats, 5);
+    assert.equal(r1.changed, false);
+    assert.equal(state.consecutiveDowngradeDays, 1);
+    // Day 2: 5 corrections again → buffer day 2, now downgrade
+    const r2 = evaluateAndAdjust(state, stats, 5);
+    assert.equal(r2.changed, true);
+    assert.equal(r2.oldLevel, 3);
+    assert.equal(r2.newLevel, 2);
   });
 
   it("no change when stable", () => {
     const state: EnforcementState = { ...createDefaultState(), currentLevel: 1 };
-    // Accuracy 60% (below 70% threshold) → no upgrade
+    // Accuracy 60% (below 75% threshold) → no upgrade
     const stats = makeStats({ totalObservations: 30, accuracy: 0.60 });
     const result = evaluateAndAdjust(state, stats, 0);
     assert.equal(result.changed, false);
@@ -309,18 +313,17 @@ describe("evaluateAndAdjust", () => {
     assert.equal(result.newLevel, 1);
   });
 
-  it("downgrade takes priority over upgrade when both conditions are met", () => {
-    // Level 2 with 5 consecutive errors (downgrade trigger) AND high accuracy (upgrade trigger)
+  it("downgrade buffered: single bad day does not downgrade", () => {
     const state: EnforcementState = {
       ...createDefaultState(),
       currentLevel: 2,
       consecutiveAccurateDays: 5,
     };
     const stats = makeStats({ totalObservations: 100, accuracy: 0.90 });
-    // recentCorrections24h doubles as recentConsecutiveErrors in evaluateAndAdjust
+    // Single day of 5 corrections — buffered, should NOT change
     const result = evaluateAndAdjust(state, stats, 5);
-    assert.equal(result.changed, true);
-    assert.equal(result.newLevel, 1); // downgrade wins
+    assert.equal(result.changed, false);
+    assert.equal(state.consecutiveDowngradeDays, 1);
   });
 });
 

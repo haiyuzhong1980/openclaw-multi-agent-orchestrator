@@ -280,7 +280,87 @@ Then add to your `openclaw.config.json`:
 
 ---
 
-## Evolution (M0 → M4 + E1–E6 + EV1–EV6)
+## Simulation Testing Framework
+
+MAO includes a comprehensive simulation harness that validates the self-evolution engine end-to-end by running accelerated multi-day scenarios against 5 user personas.
+
+### Quick Start
+
+```bash
+# Local: 30-day simulation with template messages
+./tests/simulation/run.sh
+
+# Local: 90-day stress test with LLM-generated corpus
+./tests/simulation/run.sh --days 90 --messages 80
+
+# With reproducible seed
+./tests/simulation/run.sh --days 30 --seed mytest
+
+# Docker mode (optional)
+./tests/simulation/run.sh --docker
+```
+
+### User Personas
+
+| Persona | Tier Distribution | Correction Rate | Description |
+|---|---|---|---|
+| Conservative | 40/50/10 | 70% | Prefers simple tasks, frequently corrects over-classification |
+| Aggressive | 10/30/60 | 80% | Heavily uses multi-agent delegation, corrects under-classification |
+| Developer | 15/65/20 | 50% | Technical tasks, mostly tracked work |
+| Researcher | 20/50/30 | 40% | Deep analysis, ambiguous tracked/delegation boundary |
+| Manager | 15/35/50 | 60% | Progress management, frequent delegation |
+
+### LLM-Powered Message Generation
+
+Generate realistic message corpora using the LongCat API (or any OpenAI-compatible endpoint):
+
+```bash
+# Generate 900-message corpus (60 per persona per tier)
+node --experimental-strip-types tests/simulation/llm-message-generator.ts corpus.json
+
+# Run simulation with generated corpus
+node --experimental-strip-types tests/simulation/simulate-days.ts \
+  --days 90 --messages-per-day 80 --corpus corpus.json
+```
+
+### What It Validates
+
+| Check | Description |
+|---|---|
+| Level 0→1→2→3 upgrade path | Enforcement level progresses correctly |
+| Pattern discovery | Meaningful keywords extracted from observations |
+| Downgrade on errors | Level decreases when accuracy drops |
+| Persona divergence | Different personas converge to different keyword sets |
+| Accuracy improvement | Classification accuracy improves over time |
+
+### Simulation Results (v2.0.1, 90 days × 80 msgs × 5 personas = 36,000 messages)
+
+| Persona | Final Level | Accuracy | Corrections | Keywords Learned |
+|---|---|---|---|---|
+| Conservative | L3 | 100.0% | 6 | 54 |
+| Aggressive | L3 | 100.0% | 25 | 50 |
+| Developer | L3 | 91.7% | 292 | 94 |
+| Researcher | L3 | 91.2% | 761 | 111 |
+| Manager | L3 | 91.8% | 502 | 78 |
+| **Overall** | — | **90.5%** | — | — |
+
+### Module Structure
+
+```
+tests/simulation/
+  user-profiles.ts          — 5 persona definitions with tier distributions and correction behavior
+  llm-message-generator.ts  — LongCat API corpus generator (900+ messages)
+  simulate-days.ts          — Core simulator: time-accelerated N-day evolution
+  analyze-results.ts        — ASCII sparkline analysis and comparison reports
+  corpus.json               — Pre-generated LLM message corpus
+  run.sh                    — One-command launcher (local or Docker)
+  Dockerfile                — Container image for isolated runs
+  docker-compose.yml        — Multi-service orchestration (simulator + analyzer)
+```
+
+---
+
+## Evolution (M0 → M4 + E1–E6 + EV1–EV6 + SIM)
 
 | Milestone | What was built |
 |---|---|
@@ -301,6 +381,32 @@ Then add to your `openclaw.config.json`:
 | EV4 | Daily evolution cycle: nightly analyze → discover → apply → upgrade/downgrade loop |
 | EV5 | Onboarding, user keywords, pattern export/import: first-run questionnaire + team sharing |
 | EV6 | Final integration: full test suite (700 tests), documentation, v2.0.0 release |
+| **SIM** | **Simulation testing framework: 5 personas × N days, LLM corpus generation, 3 bug fixes (level oscillation, keyword bloat, researcher misclassification), 732 tests passing, v2.0.1** |
+
+---
+
+## Changelog
+
+### v2.0.1 — Simulation Testing & Self-Evolution Fixes
+
+**New: Simulation Testing Framework** (`tests/simulation/`)
+- 5 user personas with configurable tier distributions and correction behaviors
+- Time-accelerated N-day simulation directly exercising OMA core functions
+- LLM-powered message corpus generator (LongCat API / any OpenAI-compatible endpoint)
+- ASCII sparkline analysis reports with cross-persona comparison
+- Docker support for isolated runs on remote servers
+
+**Bug Fixes:**
+- **Level oscillation eliminated** — Added 3-day cooldown after any level change + 2-day downgrade buffer. Previously all personas oscillated L1↔L2 daily; now stable progression Day1→L1→Day4→L2→Day7→L3.
+- **Keyword bloat controlled** — Added per-tier cap (80) + total cap (200) + substring deduplication in evolution cycle. Reduced learned keywords from 751→111 (researcher) and 625→94 (developer).
+- **Researcher misclassification fixed** — Raised compound action verb threshold from 3→4 for delegation; 3 verbs now classify as tracked. Researcher accuracy improved from 84.3%→91.2%.
+
+**Threshold Adjustments:**
+- L1→L2 upgrade: accuracy 70%→75%
+- L2→L3 upgrade: consecutive days 3→5
+- L3 downgrade: corrections/24h 3→5
+
+**Test Results:** 732/732 unit tests passing, 0 regressions.
 
 ---
 

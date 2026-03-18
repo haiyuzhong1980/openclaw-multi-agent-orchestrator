@@ -7,7 +7,7 @@ import type { DiscoveryResult } from "./pattern-discovery.ts";
 import { evaluateAndAdjust } from "./enforcement-ladder.ts";
 import type { EnforcementState } from "./enforcement-ladder.ts";
 import type { IntentRegistry } from "./intent-registry.ts";
-import { addUserKeyword } from "./user-keywords.ts";
+import { addUserKeyword, pruneSubstringKeywords } from "./user-keywords.ts";
 import type { UserKeywords } from "./user-keywords.ts";
 
 export interface EvolutionReport {
@@ -51,7 +51,7 @@ export function runEvolutionCycle(params: {
   existingTrackedKeywords: string[];
 }): EvolutionReport {
   const { sharedRoot, userKeywords, enforcementState, existingDelegationKeywords, existingTrackedKeywords } = params;
-  const timestamp = new Date().toISOString();
+  const timestamp = new Date(Date.now()).toISOString();
 
   // Step 1: Load last 7 days of observations
   const observations = loadRecentObservations(sharedRoot, OBSERVATION_WINDOW_HOURS);
@@ -85,6 +85,9 @@ export function runEvolutionCycle(params: {
 
   // Step 5 & 6: Auto-apply high-confidence patterns, queue mid-confidence
   const { applied, pending } = autoApplyPatterns(discoveries, userKeywords, AUTO_APPLY_THRESHOLD);
+
+  // Step 5.5: Prune substring keywords to control bloat
+  pruneSubstringKeywords(userKeywords);
 
   // Step 7: Evaluate enforcement level
   const recentCorrections24h = observations.filter(

@@ -9,6 +9,8 @@ export interface EnforcementState {
   levelHistory: Array<{ level: EnforcementLevel; timestamp: string; reason: string }>;
   lastUpgrade: string | null;
   lastDowngrade: string | null;
+  lastLevelChange: string | null;  // timestamp of any level change (for cooldown)
+  consecutiveDowngradeDays: number; // days in a row exceeding downgrade threshold
   observationCount: number;      // total observations since install
   correctionCount: number;       // total corrections received
   consecutiveAccurateDays: number;
@@ -28,13 +30,17 @@ const STATE_FILE = "enforcement-state.json";
 
 // Upgrade thresholds
 const LEVEL_0_TO_1_MIN_OBSERVATIONS = 20;
-const LEVEL_1_TO_2_MIN_ACCURACY = 0.70;
+const LEVEL_1_TO_2_MIN_ACCURACY = 0.75;   // was 0.70 — raise bar slightly
 const LEVEL_2_TO_3_MIN_ACCURACY = 0.85;
-const LEVEL_2_TO_3_MIN_ACCURATE_DAYS = 3;
+const LEVEL_2_TO_3_MIN_ACCURATE_DAYS = 5; // was 3 — require longer track record
 
 // Downgrade thresholds
-const LEVEL_3_DOWNGRADE_CORRECTIONS_24H = 3;
+const LEVEL_3_DOWNGRADE_CORRECTIONS_24H = 5;  // was 3 — less sensitive
 const LEVEL_2_DOWNGRADE_CONSECUTIVE_ERRORS = 5;
+
+// Cooldown & buffer
+const LEVEL_CHANGE_COOLDOWN_DAYS = 3;        // no level change within 3 days of last change
+const DOWNGRADE_BUFFER_DAYS = 2;             // must exceed threshold 2 consecutive days to downgrade
 
 /**
  * Create a fresh enforcement state at Level 0.
@@ -45,10 +51,12 @@ export function createDefaultState(): EnforcementState {
     levelHistory: [],
     lastUpgrade: null,
     lastDowngrade: null,
+    lastLevelChange: null,
+    consecutiveDowngradeDays: 0,
     observationCount: 0,
     correctionCount: 0,
     consecutiveAccurateDays: 0,
-    installedAt: new Date().toISOString(),
+    installedAt: new Date(Date.now()).toISOString(),
     version: 1,
   };
 }
@@ -187,15 +195,27 @@ export function shouldDowngrade(
 /**
  * Apply an upgrade or downgrade to the state (mutates in-place).
  */
+/**
+ * Check if we're within the cooldown period after last level change.
+ */
+export function isInCooldown(state: EnforcementState): boolean {
+  if (!state.lastLevelChange) return false;
+  const elapsed = Date.now() - new Date(state.lastLevelChange).getTime();
+  const cooldownMs = LEVEL_CHANGE_COOLDOWN_DAYS * 24 * 60 * 60 * 1000;
+  return elapsed < cooldownMs;
+}
+
 export function applyLevelChange(
   state: EnforcementState,
   newLevel: EnforcementLevel,
   reason: string,
 ): void {
-  const now = new Date().toISOString();
+  const now = new Date(Date.now()).toISOString();
   const oldLevel = state.currentLevel;
   state.levelHistory.push({ level: newLevel, timestamp: now, reason });
   state.currentLevel = newLevel;
+  state.lastLevelChange = now;
+  state.consecutiveDowngradeDays = 0; // reset buffer on any change
 
   if (newLevel > oldLevel) {
     state.lastUpgrade = now;
@@ -220,17 +240,39 @@ export function evaluateAndAdjust(
 } {
   const oldLevel = state.currentLevel;
 
+  // Cooldown: skip evaluation if we changed level recently
+  if (isInCooldown(state)) {
+    // Still track downgrade pressure even during cooldown
+    const recentConsecutiveErrors = recentCorrections24h;
+    const downgradeResult = shouldDowngrade(state, recentCorrections24h, recentConsecutiveErrors);
+    if (downgradeResult.downgrade) {
+      state.consecutiveDowngradeDays++;
+    } else {
+      state.consecutiveDowngradeDays = 0;
+    }
+    return { changed: false, oldLevel, newLevel: oldLevel };
+  }
+
   // Check downgrade first (degradation takes priority)
-  const recentConsecutiveErrors = recentCorrections24h; // use corrections as proxy
+  const recentConsecutiveErrors = recentCorrections24h;
   const downgradeResult = shouldDowngrade(state, recentCorrections24h, recentConsecutiveErrors);
   if (downgradeResult.downgrade && downgradeResult.newLevel !== undefined) {
-    applyLevelChange(state, downgradeResult.newLevel, downgradeResult.reason ?? "downgrade");
-    return {
-      changed: true,
-      oldLevel,
-      newLevel: downgradeResult.newLevel,
-      reason: downgradeResult.reason,
-    };
+    // Buffer: require consecutive days exceeding threshold before actually downgrading
+    state.consecutiveDowngradeDays++;
+    if (state.consecutiveDowngradeDays >= DOWNGRADE_BUFFER_DAYS) {
+      applyLevelChange(state, downgradeResult.newLevel, downgradeResult.reason ?? "downgrade");
+      return {
+        changed: true,
+        oldLevel,
+        newLevel: downgradeResult.newLevel,
+        reason: `${downgradeResult.reason} (${state.consecutiveDowngradeDays} consecutive days)`,
+      };
+    }
+    // Not enough consecutive days yet — hold level
+    return { changed: false, oldLevel, newLevel: oldLevel };
+  } else {
+    // No downgrade pressure — reset counter
+    state.consecutiveDowngradeDays = 0;
   }
 
   // Check upgrade

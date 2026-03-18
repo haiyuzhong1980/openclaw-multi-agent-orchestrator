@@ -1,6 +1,5 @@
 import { join } from "node:path";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { Type } from "@sinclair/typebox";
 import type { AnyAgentTool, OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { createMultiAgentOrchestratorTool, MultiAgentOrchestratorSchema } from "./src/tool.ts";
 import { buildOrchestratorPromptGuidance, buildDispatchGuidance } from "./src/prompt-guidance.ts";
@@ -158,12 +157,9 @@ export default function register(api: OpenClawPluginApi) {
     board,
   });
 
-  // Wrap the raw JSON Schema in a TypeBox TSchema so the tool conforms to AnyAgentTool
-  // without casting through unknown. Type.Unsafe preserves the JSON Schema wire format
-  // while satisfying the AgentTool<TParameters extends TSchema> constraint.
   const typedTool: AnyAgentTool = {
     ...tool,
-    parameters: Type.Unsafe(MultiAgentOrchestratorSchema),
+    parameters: MultiAgentOrchestratorSchema as AnyAgentTool["parameters"],
   };
   api.registerTool(typedTool);
 

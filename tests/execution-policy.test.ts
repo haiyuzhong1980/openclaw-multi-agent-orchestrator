@@ -162,13 +162,13 @@ describe("inferExecutionComplexity", () => {
     assert.equal(inferExecutionComplexity(text), "tracked");
   });
 
-  // New: compound action verb detection
-  it("returns delegation for 3 action verbs in one message", () => {
-    assert.equal(inferExecutionComplexity("请帮我审计、评测和审查整个系统的安全性"), "delegation");
+  // Compound action verb detection: 3 verbs = tracked, 4+ = delegation
+  it("returns tracked for 3 action verbs in one message", () => {
+    assert.equal(inferExecutionComplexity("请帮我审计、评测和审查整个系统的安全性"), "tracked");
   });
 
-  it("returns delegation for 3 English action verbs", () => {
-    assert.equal(inferExecutionComplexity("please audit, review and test the entire security system"), "delegation");
+  it("returns tracked for 3 English action verbs", () => {
+    assert.equal(inferExecutionComplexity("please audit, review and test the entire security system"), "tracked");
   });
 
   it("returns tracked for exactly 2 action verbs", () => {

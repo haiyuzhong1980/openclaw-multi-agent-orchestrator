@@ -145,10 +145,10 @@ export function inferExecutionComplexity(
     return "delegation";
   }
 
-  // Compound action detection: 3+ different action verbs → delegation
+  // Compound action detection: 4+ different action verbs → delegation (was 3+, too aggressive)
   const matchedActions = ACTION_VERBS.filter((v) => lower.includes(v.toLowerCase()));
   const uniqueActions = [...new Set(matchedActions)];
-  if (uniqueActions.length >= 3) {
+  if (uniqueActions.length >= 4) {
     return "delegation";
   }
 
@@ -157,6 +157,9 @@ export function inferExecutionComplexity(
   if (numberedItems && numberedItems.length >= 3 && text.length > 80) {
     return "delegation";
   }
+
+  // 3 action verbs = tracked (not delegation anymore)
+  if (uniqueActions.length >= 3) return "tracked";
 
   // Tracked markers with compound evidence
   const matchedTracked = TRACKED_MARKERS.filter((m) => lower.includes(m.toLowerCase()));
