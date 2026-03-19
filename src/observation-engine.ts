@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { ACTION_VERBS, ESCALATION_SIGNALS, DE_ESCALATION_SIGNALS } from "./constants.ts";
 
 export interface ObservationRecord {
   id: string;                    // unique ID (timestamp + random)
@@ -39,33 +40,7 @@ export interface ObservationStats {
 const OBS_FILE = "observation-log.jsonl";
 const MAX_AGE_DAYS = 30;
 
-// ACTION_VERBS duplicated from execution-policy.ts to avoid circular dependency
-const ACTION_VERBS: string[] = [
-  // Chinese
-  "审计", "评测", "审查", "分析", "调研", "测试", "部署", "检查",
-  "开发", "实现", "优化", "修复", "重构", "迁移", "设计", "构建",
-  "验收", "评估", "研究", "排查", "清理", "整理",
-  "配置", "安装", "升级", "发布", "打包", "推送", "同步",
-  "编写", "创建", "搭建", "改造", "改进",
-  "扫描", "读取", "加载", "备份", "恢复",
-  // English
-  "audit", "review", "test", "deploy", "analyze", "research",
-  "develop", "implement", "optimize", "fix", "refactor", "build",
-  "evaluate", "investigate", "design", "verify", "configure",
-  "install", "upgrade", "publish", "sync", "scan", "backup",
-];
-
-const ESCALATION_SIGNALS: RegExp[] = [
-  /应该.*派/, /应该.*agent/, /太简单/, /不要自己做/, /派出去/,
-  /你.*派.*agent/, /需要.*多.*agent/, /应该.*调度/, /为什么不派/,
-  /should.*dispatch/, /should.*delegate/, /too simple/i,
-];
-
-const DE_ESCALATION_SIGNALS: RegExp[] = [
-  /不用.*复杂/, /直接做.*好/, /太重了/, /不需要.*agent/,
-  /简单.*就行/, /不用派/, /太麻烦/, /别搞这么复杂/,
-  /too complex/i, /just do it/i, /no need.*agent/i,
-];
+// ACTION_VERBS, ESCALATION_SIGNALS, DE_ESCALATION_SIGNALS imported from constants.ts
 
 const SATISFACTION_SIGNALS: RegExp[] = [
   /^(ok|好|好的|嗯|可以|行|收到|明白|对|是的|nice|great|perfect|thanks|谢谢)[\s!！.。]*$/i,

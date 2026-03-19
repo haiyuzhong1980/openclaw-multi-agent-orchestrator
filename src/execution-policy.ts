@@ -2,6 +2,7 @@ import type { DelegationStartGateMode, ExecutionGuardRequest, ExecutionPolicyMod
 import type { IntentRegistry } from "./intent-registry.ts";
 import type { UserKeywords } from "./user-keywords.ts";
 import { checkLearnedPatterns } from "./intent-registry.ts";
+import { ACTION_VERBS } from "./constants.ts";
 
 // DELEGATION markers — any ONE of these triggers delegation
 const DELEGATION_MARKERS: string[] = [
@@ -77,21 +78,7 @@ const TRACKED_MARKERS: string[] = [
   "download", "check", "config",
 ];
 
-// ACTION VERBS for compound detection
-const ACTION_VERBS: string[] = [
-  // Chinese
-  "审计", "评测", "审查", "分析", "调研", "测试", "部署", "检查",
-  "开发", "实现", "优化", "修复", "重构", "迁移", "设计", "构建",
-  "验收", "评估", "研究", "排查", "清理", "整理",
-  "配置", "安装", "升级", "发布", "打包", "推送", "同步",
-  "编写", "创建", "搭建", "改造", "改进",
-  "扫描", "读取", "加载", "备份", "恢复",
-  // English
-  "audit", "review", "test", "deploy", "analyze", "research",
-  "develop", "implement", "optimize", "fix", "refactor", "build",
-  "evaluate", "investigate", "design", "verify", "configure",
-  "install", "upgrade", "publish", "sync", "scan", "backup",
-];
+// ACTION_VERBS imported from constants.ts
 
 export function inferExecutionComplexity(
   request?: string,

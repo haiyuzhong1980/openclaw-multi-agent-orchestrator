@@ -2,53 +2,30 @@ import { join } from "node:path";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import type { AnyAgentTool, OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { createMultiAgentOrchestratorTool, MultiAgentOrchestratorSchema } from "./src/tool.ts";
-import { buildOrchestratorPromptGuidance, buildDispatchGuidance, buildDelegationMandate } from "./src/prompt-guidance.ts";
 import { loadAgentRegistry, searchAgents, getAgentsByCategory } from "./src/agent-registry.ts";
 import { listTemplates, findTemplate } from "./src/track-templates.ts";
-import { createAuditLog, logEvent, formatAuditReport } from "./src/audit-log.ts";
-import { createSessionState, getMissingTracks } from "./src/session-state.ts";
+import { formatAuditReport } from "./src/audit-log.ts";
+import { getMissingTracks } from "./src/session-state.ts";
 import {
-  loadBoard,
-  saveBoard,
   getActiveProjects,
   getProject,
-  updateTaskStatus,
-  advanceProjectStatus,
   formatBoardDisplay,
 } from "./src/task-board.ts";
-import type { TaskBoard } from "./src/task-board.ts";
-import { processSubagentResult, isProjectReadyForReview } from "./src/result-collector.ts";
-import { reviewProject, prepareRetries } from "./src/review-gate.ts";
-import { checkAndResume, buildResumePrompt } from "./src/session-resume.ts";
+import { reviewProject } from "./src/review-gate.ts";
+import { checkAndResume } from "./src/session-resume.ts";
 import { generateProjectReport } from "./src/report-generator.ts";
-import { loadUserKeywords, saveUserKeywords, addUserKeyword } from "./src/user-keywords.ts";
-import type { UserKeywords } from "./src/user-keywords.ts";
+import { addUserKeyword, saveUserKeywords } from "./src/user-keywords.ts";
 import {
-  loadIntentRegistry,
   saveIntentRegistry,
-  extractIntentPhrases,
-  recordClassification,
-  recordCorrection,
-  detectCorrection,
 } from "./src/intent-registry.ts";
-import type { IntentRegistry } from "./src/intent-registry.ts";
-import { inferExecutionComplexity } from "./src/execution-policy.ts";
 import {
-  createObservation,
-  appendObservation,
-  updateObservationOutcome,
-  updateObservationFeedback,
-  detectFeedbackSignal,
-  flushBuffer,
-  loadRecentObservations,
   computeStats,
+  loadRecentObservations,
+  flushBuffer,
 } from "./src/observation-engine.ts";
 import { discoverPatterns, formatDiscoveryReport } from "./src/pattern-discovery.ts";
 import {
-  loadEnforcementState,
   saveEnforcementState,
-  getEnforcementBehavior,
-  evaluateAndAdjust,
   formatEnforcementStatus,
   createDefaultState,
 } from "./src/enforcement-ladder.ts";
@@ -59,19 +36,21 @@ import {
   formatEvolutionReport,
 } from "./src/evolution-cycle.ts";
 import {
-  loadOnboardingState,
   saveOnboardingState,
   needsOnboarding,
   generateWelcomeMessage,
-  processOnboardingResponse,
 } from "./src/onboarding.ts";
-import type { OnboardingState } from "./src/onboarding.ts";
 import {
   exportPatterns,
   importPatterns,
   serializeExport,
   parseImport,
 } from "./src/pattern-export.ts";
+import { createPluginState } from "./src/plugin-state.ts";
+import { createMessageHandler } from "./src/hooks/message-handler.ts";
+import { createPromptBuilder } from "./src/hooks/prompt-builder.ts";
+import { createToolHooks } from "./src/hooks/tool-hooks.ts";
+import { createSubagentHooks } from "./src/hooks/subagent-hooks.ts";
 
 const OFMS_SHARED_ROOT =
   process.env.OFMS_SHARED_ROOT ?? join(process.env.HOME ?? "", ".openclaw/shared-memory");
@@ -94,59 +73,11 @@ export default function register(api: OpenClawPluginApi) {
       ? pluginConfig.delegationStartGate
       : "required";
 
-  const auditLog = createAuditLog(200);
-  const sessionState = createSessionState();
+  const AGENT_REGISTRY_PATH =
+    process.env.AGENCY_AGENTS_PATH ?? join(process.env.HOME ?? "", "Documents/agency-agents-backup");
 
-  // Load task board from shared memory root
-  const board: TaskBoard = existsSync(OFMS_SHARED_ROOT) ? loadBoard(OFMS_SHARED_ROOT) : { projects: [], version: 1 };
-
-  // Session resume: track whether we have injected the resume prompt yet
-  let resumeInjected = false;
-
-  // Debounced board save
-  let boardSaveTimer: ReturnType<typeof setTimeout> | undefined;
-  function scheduleBoardSave(): void {
-    if (boardSaveTimer) clearTimeout(boardSaveTimer);
-    boardSaveTimer = setTimeout(() => {
-      if (existsSync(OFMS_SHARED_ROOT)) {
-        saveBoard(OFMS_SHARED_ROOT, board);
-      }
-    }, 500);
-  }
-
-  // Self-evolving intent detection state
-  const userKeywords: UserKeywords = existsSync(OFMS_SHARED_ROOT)
-    ? loadUserKeywords(OFMS_SHARED_ROOT)
-    : { delegation: [], tracked: [], light: [], updatedAt: "" };
-
-  const intentRegistry: IntentRegistry = existsSync(OFMS_SHARED_ROOT)
-    ? loadIntentRegistry(OFMS_SHARED_ROOT)
-    : { patterns: {}, totalClassifications: 0, totalCorrections: 0, lastUpdated: new Date().toISOString(), version: 1 };
-
-  let lastClassification: { phrases: string[]; tier: "light" | "tracked" | "delegation"; timestamp: number } | null = null;
-  let currentObservationId: string | null = null;
-
-  // L1: 自动编排 — 当检测到 delegation tier 时，记录请求，在下次 prompt build 时注入强制指令
-  let pendingDelegationRequest: string | null = null;
-
-  let intentRegistrySaveTimer: ReturnType<typeof setTimeout> | undefined;
-  function scheduleIntentRegistrySave(): void {
-    if (intentRegistrySaveTimer) clearTimeout(intentRegistrySaveTimer);
-    intentRegistrySaveTimer = setTimeout(() => {
-      if (existsSync(OFMS_SHARED_ROOT)) {
-        saveIntentRegistry(OFMS_SHARED_ROOT, intentRegistry);
-      }
-    }, 1000);
-  }
-
-  // EV3: Progressive enforcement ladder state
-  let enforcementState = loadEnforcementState(OFMS_SHARED_ROOT);
-
-  // EV5: Onboarding state
-  let onboardingState: OnboardingState = existsSync(OFMS_SHARED_ROOT)
-    ? loadOnboardingState(OFMS_SHARED_ROOT)
-    : { completed: false, userProfile: { customPhrases: [] } };
-  let onboardingMessageSent = false;
+  // Initialize all plugin state
+  const state = createPluginState(OFMS_SHARED_ROOT);
 
   const tool = createMultiAgentOrchestratorTool({
     executionPolicy,
@@ -154,10 +85,10 @@ export default function register(api: OpenClawPluginApi) {
     maxItemsPerTrack:
       typeof pluginConfig.maxItemsPerTrack === "number" ? pluginConfig.maxItemsPerTrack : 8,
     logger: (message) => api.logger.info(`[multi-agent-orchestrator] ${message}`),
-    sessionState,
-    auditLog,
+    sessionState: state.sessionState,
+    auditLog: state.auditLog,
     sharedRoot: OFMS_SHARED_ROOT,
-    board,
+    board: state.board,
   });
 
   const typedTool: AnyAgentTool = {
@@ -166,260 +97,29 @@ export default function register(api: OpenClawPluginApi) {
   };
   api.registerTool(typedTool);
 
+  // Register hooks
   if (pluginConfig.enabledPromptGuidance !== false) {
-    api.on("before_prompt_build", async () => {
-      // EV5: Onboarding — show welcome on first call for new users
-      if (needsOnboarding(onboardingState) && !onboardingMessageSent) {
-        onboardingMessageSent = true;
-        return { prependSystemContext: generateWelcomeMessage(onboardingState) };
-      }
-
-      const behavior = getEnforcementBehavior(enforcementState.currentLevel);
-
-      // Level 0: silent — no guidance injection
-      if (!behavior.injectGuidance) return undefined;
-
-      let guidance = buildOrchestratorPromptGuidance(executionPolicy);
-      if (existsSync(OFMS_SHARED_ROOT)) {
-        guidance +=
-          `\n\nOFMS shared memory is available at ${OFMS_SHARED_ROOT}. Pass ofmsSharedRoot="${OFMS_SHARED_ROOT}" to multi-agent-orchestrator for topic-aware planning and result feedback.`;
-      }
-
-      // E5: Inject resume context on first prompt build after startup
-      if (!resumeInjected) {
-        resumeInjected = true;
-        const resumeResult = checkAndResume(board);
-        const resumePrompt = buildResumePrompt(resumeResult);
-        if (resumePrompt) {
-          guidance += `\n\n${resumePrompt}`;
-          api.logger.info(`[OMA] Session resume: ${resumeResult.actions.length} pending actions detected`);
-        }
-      }
-
-      // Inject dispatch guidance for active projects with pending tasks (Level 2+)
-      if (behavior.injectDispatchPlan) {
-        const activeProjects = getActiveProjects(board);
-        if (activeProjects.length > 0) {
-          const project = activeProjects[activeProjects.length - 1];
-          const dispatchGuidance = buildDispatchGuidance(project);
-          if (dispatchGuidance) {
-            guidance += dispatchGuidance;
-          }
-        }
-      }
-
-      // Level 1 soft advisory message
-      if (behavior.advisoryMessage) {
-        guidance += "\n" + behavior.advisoryMessage;
-      }
-
-      // L1: 当检测到 delegation tier 时，注入强制编排指令
-      if (pendingDelegationRequest) {
-        const agentNames = (() => {
-          try {
-            const registry = loadAgentRegistry();
-            return registry.agents.map((a) => `${a.name} (${a.category}): ${a.description?.slice(0, 60) ?? ""}`);
-          } catch {
-            return undefined;
-          }
-        })();
-        guidance += buildDelegationMandate(pendingDelegationRequest, agentNames);
-        api.logger.info(`[OMA/L1] Delegation mandate injected for: ${pendingDelegationRequest.slice(0, 80)}`);
-        // 不清空 pendingDelegationRequest — 让它在整个对话轮次中保持，直到下一条消息覆盖
-      }
-
-      return { appendSystemContext: guidance };
-    });
+    const promptBuilder = createPromptBuilder(
+      state,
+      { executionPolicy, agentRegistryPath: AGENT_REGISTRY_PATH },
+      api,
+      OFMS_SHARED_ROOT,
+    );
+    api.on("before_prompt_build", promptBuilder);
   }
 
-  api.on("message_received", async (event: Record<string, unknown>) => {
-    const text = (event.content as string | undefined)?.trim();
-    if (!text) return undefined;
+  const messageHandler = createMessageHandler(state, api, OFMS_SHARED_ROOT);
+  api.on("message_received", messageHandler);
 
-    // EV5: Process onboarding response if onboarding not yet completed
-    if (!onboardingState.completed && /^[1-3][a-e]/i.test(text)) {
-      const result = processOnboardingResponse({
-        response: text,
-        onboardingState,
-        userKeywords,
-        enforcementState,
-      });
-      if (result.configured) {
-        if (existsSync(OFMS_SHARED_ROOT)) {
-          saveOnboardingState(OFMS_SHARED_ROOT, onboardingState);
-          saveUserKeywords(OFMS_SHARED_ROOT, userKeywords);
-          saveEnforcementState(OFMS_SHARED_ROOT, enforcementState);
-        }
-        api.logger.info(`[OMA] Onboarding complete: level=${result.initialLevel}, keywords=${result.keywordsAdded.length}`);
-      }
-    }
+  const toolHooks = createToolHooks(state, api, OFMS_SHARED_ROOT, { executionPolicy, delegationStartGate });
+  api.on("before_tool_call", toolHooks.beforeToolCall);
+  api.on("after_tool_call", toolHooks.afterToolCall);
 
-    // Extract phrases for intent learning
-    const phrases = extractIntentPhrases(text);
+  const subagentHooks = createSubagentHooks(state, api);
+  api.on("subagent_spawned", subagentHooks.subagentSpawned);
+  api.on("subagent_ended", subagentHooks.subagentEnded);
 
-    // Check if this is a correction of previous classification
-    if (lastClassification) {
-      const correction = detectCorrection(text, lastClassification.tier);
-      if (correction.isCorrection && correction.actualTier) {
-        recordCorrection(intentRegistry, lastClassification.phrases, lastClassification.tier, correction.actualTier);
-        api.logger.info(`[OMA] Intent correction detected: ${lastClassification.tier} → ${correction.actualTier}`);
-      }
-    }
-
-    // Check if this message is feedback on the previous observation
-    if (currentObservationId && lastClassification && existsSync(OFMS_SHARED_ROOT)) {
-      const feedback = detectFeedbackSignal(text, lastClassification.tier);
-      updateObservationFeedback(OFMS_SHARED_ROOT, currentObservationId, {
-        userFollowUp: feedback.type,
-        actualTier: feedback.actualTier,
-      });
-    }
-
-    // Record the current classification
-    const tier = inferExecutionComplexity(text, intentRegistry, userKeywords);
-    recordClassification(intentRegistry, phrases, tier);
-    lastClassification = { phrases, tier, timestamp: Date.now() };
-
-    // L1: 当检测到 delegation tier，记录请求以便 before_prompt_build 注入强制指令
-    if (tier === "delegation") {
-      pendingDelegationRequest = text;
-      api.logger.info(`[OMA/L1] Delegation detected, will inject mandate on next prompt build`);
-    } else {
-      pendingDelegationRequest = null;
-    }
-
-    // Create new observation
-    if (existsSync(OFMS_SHARED_ROOT)) {
-      const obs = createObservation({
-        message: text,
-        agent: (event.channelId as string | undefined) ?? "unknown",
-        predictedTier: tier,
-      });
-      appendObservation(OFMS_SHARED_ROOT, obs);
-      currentObservationId = obs.id;
-    }
-
-    scheduleIntentRegistrySave();
-    return undefined;
-  });
-
-  api.on("before_tool_call", async (event: Record<string, unknown>) => {
-    const blockReason = event.blockReason as string | undefined;
-    if (blockReason) {
-      logEvent(auditLog, "tool_blocked", { toolName: event.toolName, reason: blockReason });
-    }
-
-    const behavior = getEnforcementBehavior(enforcementState.currentLevel);
-    if (!behavior.blockNonDispatchTools) {
-      // Level 0, 1, 2: don't block, just log
-      if (behavior.logOnly) return undefined; // Level 0: silent
-      // Level 1, 2: log but allow
-      return undefined;
-    }
-    // Level 3: existing hard block logic is handled by the tool itself via blockReason above
-
-    return undefined;
-  });
-
-  api.on("after_tool_call", async (event: Record<string, unknown>) => {
-    if (currentObservationId && existsSync(OFMS_SHARED_ROOT)) {
-      const toolName = event.toolName as string | undefined;
-      if (toolName) {
-        updateObservationOutcome(OFMS_SHARED_ROOT, currentObservationId, {
-          toolsCalled: [toolName],
-          didSpawnSubagent: toolName === "sessions_spawn",
-          spawnCount: toolName === "sessions_spawn" ? 1 : 0,
-        });
-      }
-    }
-    return undefined;
-  });
-
-  api.on("subagent_spawned", async (event: Record<string, unknown>) => {
-    const sessionKey = event.childSessionKey as string | undefined;
-    const label = event.label as string | undefined;
-
-    logEvent(auditLog, "subagent_spawned", {
-      sessionKey,
-      agentId: event.agentId,
-      label,
-    });
-
-    // Find a pending task matching by label or trackId and mark dispatched
-    if (sessionKey) {
-      for (const project of board.projects) {
-        if (project.status === "done" || project.status === "failed") continue;
-        const task = project.tasks.find(
-          (t) => t.status === "pending" && (label ? t.label === label || t.trackId === label : false),
-        ) ?? project.tasks.find((t) => t.status === "pending");
-        if (task) {
-          updateTaskStatus(task, "dispatched", { sessionKey });
-          advanceProjectStatus(project);
-          scheduleBoardSave();
-          break;
-        }
-      }
-    }
-
-    return undefined;
-  });
-
-  api.on("subagent_ended", async (event: Record<string, unknown>) => {
-    const sessionKey = event.targetSessionKey as string | undefined;
-    const outcome = event.outcome as string | undefined;
-
-    logEvent(auditLog, "subagent_ended", { sessionKey, outcome });
-
-    // E3: Update task board
-    if (sessionKey) {
-      const normalizedOutcome = (outcome === "failed" || outcome === "timeout" || outcome === "killed")
-        ? (outcome as "error" | "timeout" | "killed")
-        : "ok";
-
-      const result = processSubagentResult({
-        board,
-        sessionKey,
-        outcome: normalizedOutcome,
-      });
-
-      if (result.updated) {
-        api.logger.info(`[OMA] Task ${result.taskId} updated: ${outcome}`);
-
-        // E4: Auto-review when project is ready
-        const project = getProject(board, result.projectId!);
-        if (project && isProjectReadyForReview(project)) {
-          const { reviews, needsRetry, allApproved } = reviewProject(project);
-
-          api.logger.info(
-            `[OMA] Project ${project.id} reviewed: ${reviews.filter((r) => r.approved).length} approved, ${needsRetry.length} need retry`,
-          );
-
-          if (needsRetry.length > 0) {
-            prepareRetries(needsRetry);
-            api.logger.info(`[OMA] ${needsRetry.length} tasks prepared for retry`);
-          }
-
-          if (allApproved) {
-            project.status = "done";
-            api.logger.info(`[OMA] Project ${project.id} DONE — all tasks approved`);
-            // E6: Auto-log report when project completes
-            const report = generateProjectReport(project);
-            api.logger.info(`[OMA] Project report:\n${report}`);
-          }
-
-          advanceProjectStatus(project);
-        }
-
-        scheduleBoardSave();
-      }
-    }
-
-    return undefined;
-  });
-
-  const AGENT_REGISTRY_PATH =
-    process.env.AGENCY_AGENTS_PATH ?? join(process.env.HOME ?? "", "Documents/agency-agents-backup");
-
+  // Register commands
   api.registerCommand({
     name: "mao-agents",
     description: "List available agents from the agent library. Optionally search by keyword.",
@@ -516,7 +216,7 @@ export default function register(api: OpenClawPluginApi) {
     name: "mao-audit",
     description: "Show recent orchestration audit log",
     handler: () => {
-      const report = formatAuditReport(auditLog, 30);
+      const report = formatAuditReport(state.auditLog, 30);
       return { text: report || "No audit events recorded." };
     },
   });
@@ -525,14 +225,14 @@ export default function register(api: OpenClawPluginApi) {
     name: "mao-state",
     description: "Show current orchestration session state",
     handler: () => {
-      const missing = getMissingTracks(sessionState);
+      const missing = getMissingTracks(state.sessionState);
       return {
         text: JSON.stringify(
           {
-            plannedTracks: sessionState.plannedTracks,
+            plannedTracks: state.sessionState.plannedTracks,
             missingTracks: missing,
-            enforcementCount: sessionState.enforcementHistory.length,
-            totalToolCalls: sessionState.totalToolCalls,
+            enforcementCount: state.sessionState.enforcementHistory.length,
+            totalToolCalls: state.sessionState.totalToolCalls,
           },
           null,
           2,
@@ -545,7 +245,7 @@ export default function register(api: OpenClawPluginApi) {
     name: "mao-board",
     description: "Show all projects and tasks on the orchestration task board",
     handler: () => {
-      const display = formatBoardDisplay(board);
+      const display = formatBoardDisplay(state.board);
       return { text: display };
     },
   });
@@ -557,7 +257,7 @@ export default function register(api: OpenClawPluginApi) {
     handler: (ctx) => {
       const projectId = (ctx.args ?? "").trim();
       if (!projectId) return { text: "Usage: /mao-project <project-id>" };
-      const project = getProject(board, projectId);
+      const project = getProject(state.board, projectId);
       if (!project) return { text: `No project found with ID "${projectId}"` };
       const lines = [
         `**${project.name}** (${project.status})`,
@@ -584,11 +284,11 @@ export default function register(api: OpenClawPluginApi) {
     name: "mao-review",
     description: "Review results of the current active project",
     handler: () => {
-      const active = getActiveProjects(board);
+      const active = getActiveProjects(state.board);
       if (active.length === 0) return { text: "No active projects." };
       const project = active[0];
       const { reviews, needsRetry, allApproved } = reviewProject(project);
-      scheduleBoardSave();
+      state.scheduleBoardSave();
       return {
         text: JSON.stringify(
           {
@@ -614,7 +314,7 @@ export default function register(api: OpenClawPluginApi) {
     name: "mao-resume",
     description: "Check for interrupted work and show resume actions",
     handler: () => {
-      const resumeResult = checkAndResume(board);
+      const resumeResult = checkAndResume(state.board);
       if (!resumeResult.resumed) {
         return { text: "No interrupted work detected. All projects are complete or idle." };
       }
@@ -643,12 +343,12 @@ export default function register(api: OpenClawPluginApi) {
       const projectId = (ctx.args ?? "").trim();
       let project;
       if (projectId) {
-        project = getProject(board, projectId);
+        project = getProject(state.board, projectId);
         if (!project) return { text: `No project found with ID "${projectId}"` };
       } else {
         // Default to the most recent project
-        if (board.projects.length === 0) return { text: "No projects on the board." };
-        project = board.projects[board.projects.length - 1];
+        if (state.board.projects.length === 0) return { text: "No projects on the board." };
+        project = state.board.projects[state.board.projects.length - 1];
       }
       const report = generateProjectReport(project);
       return { text: report };
@@ -707,12 +407,12 @@ export default function register(api: OpenClawPluginApi) {
     name: "mao-setup",
     description: "Configure OMA preferences (re-run onboarding)",
     handler: () => {
-      onboardingState.completed = false;
+      state.onboardingState.completed = false;
       if (existsSync(OFMS_SHARED_ROOT)) {
-        saveOnboardingState(OFMS_SHARED_ROOT, onboardingState);
+        saveOnboardingState(OFMS_SHARED_ROOT, state.onboardingState);
       }
-      onboardingMessageSent = false;
-      return { text: generateWelcomeMessage(onboardingState) };
+      state.onboardingMessageSent = false;
+      return { text: generateWelcomeMessage(state.onboardingState) };
     },
   });
 
@@ -729,9 +429,9 @@ export default function register(api: OpenClawPluginApi) {
       if (!["delegation", "tracked", "light"].includes(tier)) {
         return { text: "无效等级。使用: delegation, tracked, 或 light" };
       }
-      addUserKeyword(userKeywords, tier, phrase);
+      addUserKeyword(state.userKeywords, tier, phrase);
       if (existsSync(OFMS_SHARED_ROOT)) {
-        saveUserKeywords(OFMS_SHARED_ROOT, userKeywords);
+        saveUserKeywords(OFMS_SHARED_ROOT, state.userKeywords);
       }
       return { text: `已添加 "${phrase}" 到 ${tier} 级别。` };
     },
@@ -741,7 +441,7 @@ export default function register(api: OpenClawPluginApi) {
     name: "mao-learned",
     description: "Show what OMA has learned about your intent patterns",
     handler: () => {
-      const patterns = Object.values(intentRegistry.patterns)
+      const patterns = Object.values(state.intentRegistry.patterns)
         .filter((p) => p.occurrences >= 2)
         .sort((a, b) => b.occurrences - a.occurrences)
         .slice(0, 20);
@@ -761,7 +461,7 @@ export default function register(api: OpenClawPluginApi) {
 
       return {
         text: [
-          `OMA 已学习 ${Object.keys(intentRegistry.patterns).length} 个模式，${intentRegistry.totalCorrections} 次纠正`,
+          `OMA 已学习 ${Object.keys(state.intentRegistry.patterns).length} 个模式，${state.intentRegistry.totalCorrections} 次纠正`,
           "",
           ...lines,
         ].join("\n"),
@@ -804,8 +504,8 @@ export default function register(api: OpenClawPluginApi) {
       }
       const result = discoverPatterns(
         observations,
-        [], // TODO: pass current delegation keywords
-        [], // TODO: pass current tracked keywords
+        state.userKeywords.delegation,
+        state.userKeywords.tracked,
       );
       return { text: formatDiscoveryReport(result) };
     },
@@ -816,7 +516,7 @@ export default function register(api: OpenClawPluginApi) {
     description: "Show current enforcement level and upgrade/downgrade progress",
     handler: () => {
       const stats = computeStats(loadRecentObservations(OFMS_SHARED_ROOT, 24 * 7));
-      return { text: formatEnforcementStatus(enforcementState, stats) };
+      return { text: formatEnforcementStatus(state.enforcementState, stats) };
     },
   });
 
@@ -824,8 +524,8 @@ export default function register(api: OpenClawPluginApi) {
     name: "mao-reset",
     description: "Reset OMA to Level 0 (restart observation phase)",
     handler: () => {
-      enforcementState = createDefaultState();
-      saveEnforcementState(OFMS_SHARED_ROOT, enforcementState);
+      state.enforcementState = createDefaultState();
+      saveEnforcementState(OFMS_SHARED_ROOT, state.enforcementState);
       return { text: "OMA reset to Level 0. Observation phase restarted." };
     },
   });
@@ -835,9 +535,9 @@ export default function register(api: OpenClawPluginApi) {
     description: "Export learned patterns to a shareable file",
     handler: () => {
       const exported = exportPatterns({
-        intentRegistry,
-        userKeywords,
-        enforcementState,
+        intentRegistry: state.intentRegistry,
+        userKeywords: state.userKeywords,
+        enforcementState: state.enforcementState,
         observations: loadRecentObservations(OFMS_SHARED_ROOT, 24 * 30),
       });
       const json = serializeExport(exported);
@@ -860,10 +560,10 @@ export default function register(api: OpenClawPluginApi) {
         const json = readFileSync(filePath, "utf-8");
         const exported = parseImport(json);
         if (!exported) return { text: "Invalid export file format." };
-        const result = importPatterns({ exported, intentRegistry, userKeywords });
+        const result = importPatterns({ exported, intentRegistry: state.intentRegistry, userKeywords: state.userKeywords });
         if (existsSync(OFMS_SHARED_ROOT)) {
-          saveIntentRegistry(OFMS_SHARED_ROOT, intentRegistry);
-          saveUserKeywords(OFMS_SHARED_ROOT, userKeywords);
+          saveIntentRegistry(OFMS_SHARED_ROOT, state.intentRegistry);
+          saveUserKeywords(OFMS_SHARED_ROOT, state.userKeywords);
         }
         return { text: `Imported ${result.patternsImported} patterns and ${result.keywordsImported} keywords.` };
       } catch (e) {
@@ -872,22 +572,21 @@ export default function register(api: OpenClawPluginApi) {
     },
   });
 
-
   api.registerCommand({
     name: "mao-evolve",
     description: "Manually trigger an evolution cycle",
     handler: () => {
       const report = runEvolutionCycle({
         sharedRoot: OFMS_SHARED_ROOT,
-        intentRegistry,
-        userKeywords,
-        enforcementState,
+        intentRegistry: state.intentRegistry,
+        userKeywords: state.userKeywords,
+        enforcementState: state.enforcementState,
         existingDelegationKeywords: [],
         existingTrackedKeywords: [],
       });
-      saveUserKeywords(OFMS_SHARED_ROOT, userKeywords);
-      saveIntentRegistry(OFMS_SHARED_ROOT, intentRegistry);
-      saveEnforcementState(OFMS_SHARED_ROOT, enforcementState);
+      saveUserKeywords(OFMS_SHARED_ROOT, state.userKeywords);
+      saveIntentRegistry(OFMS_SHARED_ROOT, state.intentRegistry);
+      saveEnforcementState(OFMS_SHARED_ROOT, state.enforcementState);
       appendEvolutionReport(OFMS_SHARED_ROOT, report);
       return { text: formatEvolutionReport(report) };
     },
@@ -911,17 +610,17 @@ export default function register(api: OpenClawPluginApi) {
     if (today !== lastEvolutionDate) {
       const report = runEvolutionCycle({
         sharedRoot: OFMS_SHARED_ROOT,
-        intentRegistry,
-        userKeywords,
-        enforcementState,
+        intentRegistry: state.intentRegistry,
+        userKeywords: state.userKeywords,
+        enforcementState: state.enforcementState,
         existingDelegationKeywords: [],
         existingTrackedKeywords: [],
       });
       lastEvolutionDate = today;
       if (report.autoApplied.length > 0 || report.enforcementLevelBefore !== report.enforcementLevelAfter) {
         api.logger.info(`[OMA Evolution] ${report.summary}`);
-        saveUserKeywords(OFMS_SHARED_ROOT, userKeywords);
-        saveEnforcementState(OFMS_SHARED_ROOT, enforcementState);
+        saveUserKeywords(OFMS_SHARED_ROOT, state.userKeywords);
+        saveEnforcementState(OFMS_SHARED_ROOT, state.enforcementState);
         appendEvolutionReport(OFMS_SHARED_ROOT, report);
       }
     }
@@ -931,7 +630,7 @@ export default function register(api: OpenClawPluginApi) {
   // Flush observation buffer on service stop
   process.on("exit", () => {
     flushBuffer(OFMS_SHARED_ROOT);
-    saveEnforcementState(OFMS_SHARED_ROOT, enforcementState);
+    saveEnforcementState(OFMS_SHARED_ROOT, state.enforcementState);
   });
 
   api.registerCli(

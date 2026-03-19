@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { CHINESE_STOP_CHARS, ENGLISH_STOP_WORDS, ESCALATION_SIGNALS, DE_ESCALATION_SIGNALS } from "./constants.ts";
 
 export interface IntentPattern {
   phrase: string;
@@ -25,23 +26,7 @@ export interface IntentRegistry {
 
 const INTENT_REGISTRY_FILE = "intent-registry.json";
 
-// Chinese stop words (common single characters to skip as standalone phrases)
-const CHINESE_STOP_CHARS = new Set([
-  "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一", "一个",
-  "上", "也", "很", "到", "说", "要", "去", "你", "会", "着", "没有", "看", "好",
-  "自", "这", "那", "什么", "没", "为", "啊", "把", "被", "让", "从", "与",
-]);
-
-// English stop words
-const ENGLISH_STOP_WORDS = new Set([
-  "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-  "have", "has", "had", "do", "does", "did", "will", "would", "shall", "should",
-  "may", "might", "must", "can", "could", "to", "of", "in", "on", "at",
-  "by", "for", "with", "from", "as", "it", "its", "this", "that", "these",
-  "those", "and", "or", "but", "not", "no", "so", "if", "then", "than",
-  "all", "also", "just", "me", "my", "we", "our", "you", "your", "he",
-  "she", "they", "them", "their", "i", "am", "now", "please", "ok",
-]);
+// CHINESE_STOP_CHARS and ENGLISH_STOP_WORDS imported from constants.ts
 
 export function createEmptyRegistry(): IntentRegistry {
   return {
@@ -239,27 +224,7 @@ export function checkLearnedPatterns(
   return null;
 }
 
-// Escalation signals: user telling the system to use more agents
-const ESCALATION_SIGNALS = [
-  /应该派.*(agent|子|工)/,
-  /不要自己做/,
-  /派出去/,
-  /用多.*agent/,
-  /需要.*agent.*去/,
-  /应该.*调度/,
-  /太简单了/,
-  /这个要.*agent/,
-];
-
-// De-escalation signals: user telling the system it's overdoing it
-const DE_ESCALATION_SIGNALS = [
-  /不用这么复杂/,
-  /直接做就好/,
-  /太重了/,
-  /不需要.*agent/,
-  /简单.*就行/,
-  /不用派/,
-];
+// ESCALATION_SIGNALS and DE_ESCALATION_SIGNALS imported from constants.ts
 
 /**
  * Detect if user's current message is a correction of the previous classification.

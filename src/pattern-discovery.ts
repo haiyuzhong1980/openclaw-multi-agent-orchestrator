@@ -1,4 +1,5 @@
 import type { ObservationRecord } from "./observation-engine.js";
+import { ENGLISH_STOP_WORDS, CHINESE_STOP_CHARS } from "./constants.ts";
 
 export interface DiscoveredPattern {
   phrase: string;
@@ -22,23 +23,7 @@ export interface DiscoveryResult {
   overallAccuracy: number;
 }
 
-// English stop words (shared with intent-registry pattern)
-const ENGLISH_STOP_WORDS = new Set([
-  "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
-  "have", "has", "had", "do", "does", "did", "will", "would", "shall", "should",
-  "may", "might", "must", "can", "could", "to", "of", "in", "on", "at",
-  "by", "for", "with", "from", "as", "it", "its", "this", "that", "these",
-  "those", "and", "or", "but", "not", "no", "so", "if", "then", "than",
-  "all", "also", "just", "me", "my", "we", "our", "you", "your", "he",
-  "she", "they", "them", "their", "i", "am", "now", "please", "ok",
-]);
-
-// Chinese stop characters (single chars commonly skipped)
-const CHINESE_STOP_CHARS = new Set([
-  "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都", "一",
-  "上", "也", "很", "到", "说", "要", "去", "你", "会", "着", "没", "看",
-  "好", "自", "这", "那", "什", "为", "啊", "把", "被", "让", "从", "与",
-]);
+// ENGLISH_STOP_WORDS and CHINESE_STOP_CHARS imported from constants.ts
 
 /**
  * Extract significant words/phrases from a message.
