@@ -7,10 +7,12 @@ import { getEnforcementBehavior } from "../enforcement-ladder.ts";
 import { checkAndResume, buildResumePrompt } from "../session-resume.ts";
 import { needsOnboarding, generateWelcomeMessage } from "../onboarding.ts";
 import type { PluginState } from "../plugin-state.ts";
+import { buildUnifiedPreamble } from "../preamble.ts";
+import type { PreambleConfig } from "../preamble.ts";
 
 export function createPromptBuilder(
   state: PluginState,
-  config: { executionPolicy: string; agentRegistryPath: string },
+  config: { executionPolicy: string; agentRegistryPath: string; preambleConfig?: Partial<PreambleConfig> },
   api: Pick<OpenClawPluginApi, "logger">,
   sharedRoot: string,
 ): () => Promise<{ prependSystemContext: string } | { appendSystemContext: string } | undefined> {
@@ -25,6 +27,22 @@ export function createPromptBuilder(
 
     // Level 0: silent — no guidance injection
     if (!behavior.injectGuidance) return undefined;
+
+    // Preamble injection: 当有 active project 时，注入统一 Preamble
+    const activeProjectsForPreamble = getActiveProjects(state.board);
+    if (activeProjectsForPreamble.length > 0) {
+      const activeProject = activeProjectsForPreamble[activeProjectsForPreamble.length - 1];
+      const preamble = buildUnifiedPreamble({
+        agentName: config.preambleConfig?.agentName ?? "orchestrator",
+        agentRole: config.preambleConfig?.agentRole ?? "编排者（orchestrator）",
+        sessionId: config.preambleConfig?.sessionId,
+        projectName: config.preambleConfig?.projectName ?? activeProject.name,
+        currentBranch: config.preambleConfig?.currentBranch,
+        activeAgentCount: config.preambleConfig?.activeAgentCount ?? activeProjectsForPreamble.length,
+      });
+      api.logger.info(`[OMA] Preamble injected for project: ${activeProject.name}`);
+      return { prependSystemContext: preamble };
+    }
 
     let guidance = buildOrchestratorPromptGuidance(config.executionPolicy);
     if (existsSync(sharedRoot)) {

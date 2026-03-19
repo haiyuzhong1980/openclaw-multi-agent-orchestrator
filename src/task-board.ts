@@ -3,6 +3,7 @@ import { join } from "node:path";
 
 export type ProjectStatus = "pending" | "planning" | "dispatching" | "running" | "reviewing" | "done" | "failed";
 export type TaskStatus = "pending" | "dispatched" | "running" | "completed" | "failed" | "approved" | "rejected";
+export type SprintStage = "plan" | "build" | "review" | "test" | "ship";
 
 export interface Task {
   id: string;
@@ -22,6 +23,7 @@ export interface Task {
   retryCount: number;
   maxRetry: number;
   failureReason?: string;
+  stage?: SprintStage;
 }
 
 export interface Project {
@@ -32,6 +34,13 @@ export interface Project {
   createdAt: string;
   updatedAt: string;
   tasks: Task[];
+  currentStage: SprintStage;
+  stageHistory: Array<{
+    stage: SprintStage;
+    enteredAt: string;
+    completedAt?: string;
+    taskIds: string[];
+  }>;
 }
 
 export interface TaskBoard {
@@ -93,6 +102,8 @@ export function createProject(
     createdAt: now,
     updatedAt: now,
     tasks: [],
+    currentStage: "plan",
+    stageHistory: [],
   };
   board.projects.push(project);
   return project;
@@ -153,6 +164,8 @@ export function updateTaskStatus(
   }
 }
 
+const SPRINT_STAGE_ORDER: SprintStage[] = ["plan", "build", "review", "test", "ship"];
+
 export function advanceProjectStatus(project: Project): void {
   const tasks = project.tasks;
   if (tasks.length === 0) {
@@ -163,7 +176,17 @@ export function advanceProjectStatus(project: Project): void {
 
   const allApproved = tasks.every((t) => t.status === "approved");
   if (allApproved) {
-    project.status = "done";
+    // If tasks have stage assignments, check whether the current sprint stage is complete
+    // and advance to the next stage. Only mark "done" when at the last stage (or no stage tags).
+    const hasStageAssignments = tasks.some((t) => t.stage !== undefined);
+    if (hasStageAssignments && isStageComplete(project)) {
+      const nextStage = advanceStage(project);
+      if (nextStage === null) {
+        project.status = "done";
+      }
+    } else if (!hasStageAssignments) {
+      project.status = "done";
+    }
     project.updatedAt = new Date().toISOString();
     return;
   }
@@ -241,6 +264,100 @@ export function getRetryableTasks(project: Project): Task[] {
 
 export function getPendingTasks(project: Project): Task[] {
   return project.tasks.filter((t) => t.status === "pending");
+}
+
+const STAGE_AGENT_TYPES: Record<SprintStage, string[]> = {
+  plan: ["planner", "architect", "analyst"],
+  build: ["executor", "coder"],
+  review: ["code-reviewer", "security-reviewer"],
+  test: ["tdd-guide", "test-engineer", "qa-tester"],
+  ship: ["git-master", "doc-updater"],
+};
+
+export function advanceStage(project: Project): SprintStage | null {
+  const currentStage = project.currentStage ?? "plan";
+  const currentIndex = SPRINT_STAGE_ORDER.indexOf(currentStage);
+  const nextIndex = currentIndex + 1;
+
+  if (nextIndex >= SPRINT_STAGE_ORDER.length) {
+    return null;
+  }
+
+  const now = new Date().toISOString();
+  const currentStageTasks = project.tasks
+    .filter((t) => t.stage === currentStage)
+    .map((t) => t.id);
+
+  // Close out the current stage in history
+  const existingEntry = project.stageHistory.find((h) => h.stage === currentStage && !h.completedAt);
+  if (existingEntry) {
+    existingEntry.completedAt = now;
+  }
+
+  const nextStage = SPRINT_STAGE_ORDER[nextIndex];
+  project.stageHistory.push({
+    stage: nextStage,
+    enteredAt: now,
+    taskIds: currentStageTasks,
+  });
+  project.currentStage = nextStage;
+  project.updatedAt = now;
+  return nextStage;
+}
+
+export function getStageAgentTypes(stage: SprintStage): string[] {
+  return STAGE_AGENT_TYPES[stage];
+}
+
+export function isStageComplete(project: Project): boolean {
+  const currentStage = project.currentStage ?? "plan";
+  const stageTasks = project.tasks.filter((t) => t.stage === currentStage);
+  if (stageTasks.length === 0) {
+    return false;
+  }
+  return stageTasks.every(
+    (t) => t.status === "completed" || t.status === "approved" || t.status === "failed",
+  );
+}
+
+const STAGE_LABELS: Record<SprintStage, string> = {
+  plan: "Plan",
+  build: "Build",
+  review: "Review",
+  test: "Test",
+  ship: "Ship",
+};
+
+export function formatSprintBoard(project: Project): string {
+  const currentStage = project.currentStage ?? "plan";
+  const lines: string[] = [];
+
+  lines.push(`Sprint: ${project.name}`);
+  lines.push(`Stage: ${STAGE_LABELS[currentStage]} [${currentStage}]`);
+  lines.push("");
+
+  for (const stage of SPRINT_STAGE_ORDER) {
+    const isActive = stage === currentStage;
+    const historyEntry = project.stageHistory.find((h) => h.stage === stage);
+    const isDone = historyEntry?.completedAt !== undefined;
+    const marker = isDone ? "[x]" : isActive ? "[>]" : "[ ]";
+    lines.push(`  ${marker} ${STAGE_LABELS[stage]}`);
+  }
+
+  lines.push("");
+
+  const stageTasks = project.tasks.filter((t) => t.stage === currentStage);
+  if (stageTasks.length > 0) {
+    lines.push(`Tasks in ${STAGE_LABELS[currentStage]}:`);
+    for (const task of stageTasks) {
+      const icon = STATUS_ICONS[task.status] ?? "⬜";
+      lines.push(`  - ${task.label}   ${icon} ${task.status}`);
+    }
+  } else {
+    lines.push(`No tasks assigned to ${STAGE_LABELS[currentStage]} stage.`);
+  }
+
+  return lines.join("\n");
 }
 
 const STATUS_ICONS: Record<TaskStatus, string> = {
