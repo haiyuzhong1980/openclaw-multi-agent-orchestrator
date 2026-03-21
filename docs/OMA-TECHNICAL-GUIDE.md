@@ -150,7 +150,11 @@ TaskBoard
               ├── sessionKey?: string    // 关联的子 Agent session
               ├── retryCount: number     // 当前重试次数
               ├── maxRetry: number       // 最大重试次数（默认 2）
-              └── resultText?: string    // 执行结果
+              ├── resultText?: string    // 执行结果
+              ├── blockedBy: string[]    // v3.1: 等待这些任务完成
+              ├── blocks: string[]       // v3.1: 阻塞这些任务
+              ├── lockedBy?: string      // v3.1: 当前锁定的 agentId
+              └── lockedAt?: string      // v3.1: 锁定时间戳
 ```
 
 **Sprint 五阶段 Agent 映射:**
@@ -162,6 +166,48 @@ TaskBoard
 | review | code-reviewer, security-reviewer |
 | test | tdd-guide, test-engineer, qa-tester |
 | ship | git-master, doc-updater |
+
+**任务依赖链（v3.1 新增）:**
+
+支持任务间依赖关系，实现"任务 B 等待任务 A 完成后才能开始"：
+
+```
+Task A (completed) ──blocks──> Task B (ready)
+Task B (pending)    <──needs──  Task A
+```
+
+**核心函数:**
+
+| 函数 | 功能 |
+|------|------|
+| `isTaskBlocked(board, task)` | 检查任务是否被阻塞 |
+| `acquireTaskLock(board, taskId, agentId)` | 获取任务锁 |
+| `releaseTaskLock(board, taskId)` | 释放任务锁 |
+| `getDownstreamTasks(board, taskId)` | 获取下游依赖任务 |
+| `detectDependencyCycle(board, taskId)` | 检测循环依赖 |
+| `addTaskDependency(board, blockingId, blockedId)` | 添加依赖关系 |
+| `getReadyTasks(project, board)` | 获取可派遣的任务 |
+
+**CLI 命令:**
+
+```bash
+/mao-task-dependencies <taskId>           # 查看任务依赖状态
+/mao-task-dep <taskId> --needs <otherId>  # 添加依赖
+/mao-task-dep <taskId> --unblock <otherId> # 移除依赖
+```
+
+**orchestrate 参数:**
+
+```json
+{
+  "action": "orchestrate",
+  "request": "Code review project",
+  "taskDependencies": {
+    "Security review": ["Performance review"],
+    "Performance review": ["Final report"]
+  }
+}
+```
 
 ### 4. 自进化引擎
 
@@ -366,7 +412,7 @@ OMA 与 OAG（OpenClaw Auto Gateway）互补协作:
 | execution-policy | ~100 | 意图分类所有路径 |
 | observation-engine | ~70 | 记录、统计、反馈更新 |
 | pattern-discovery | ~80 | TF-IDF 计算、模式过滤 |
-| task-board | ~90 | 状态机、Sprint 阶段 |
+| task-board | ~110 | 状态机、Sprint 阶段、依赖链 |
 | preamble | ~40 | 五块内容生成 |
 | status-protocol | ~50 | 序列化、3-strike |
 | wtf-likelihood | ~60 | 评分计算、阈值 |
@@ -384,11 +430,27 @@ OMA 与 OAG（OpenClaw Auto Gateway）互补协作:
 | `before_prompt_build` Hook | < 1ms | 纯内存操作 |
 | `before_tool_call` Hook | < 0.5ms | 纯内存检查 |
 | `runEvolutionCycle()` | 10-100ms | 读取 7 天 JSONL |
-| 979 个单元测试 | ~2.5s | 纯函数，无 I/O |
+| 999 个单元测试 | ~2.7s | 纯函数，无 I/O |
 
 ---
 
 ## 版本历史
+
+### v3.1.0 (2026-03-21)
+
+**新功能（M5: 任务依赖链）:**
+- Task 类型扩展: `blockedBy`, `blocks`, `lockedBy`, `lockedAt`
+- `isTaskBlocked()` 检查任务是否被依赖阻塞
+- `acquireTaskLock()` / `releaseTaskLock()` 任务锁定机制
+- `getDownstreamTasks()` 获取下游依赖任务
+- `detectDependencyCycle()` 循环依赖检测
+- `addTaskDependency()` / `removeTaskDependency()` 管理依赖关系
+- `getReadyTasks()` 获取可派遣的任务
+- `updateTaskStatus()` 支持依赖检查和自动解除阻塞
+- CLI 命令: `/mao-task-dependencies`, `/mao-task-dep`
+- `orchestrate` action 支持 `taskDependencies` 参数
+
+**测试覆盖:** 999 个单元测试（+20 依赖链测试）
 
 ### v3.0.1 (2026-03-21)
 
