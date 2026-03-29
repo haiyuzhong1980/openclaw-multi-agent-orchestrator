@@ -7,6 +7,7 @@ import {
   createEmptyBoard,
   loadBoard,
   saveBoard,
+  saveBoardWithVersionCheck,
   createProject,
   addTask,
   updateTaskStatus,
@@ -22,6 +23,8 @@ import {
   // M5: Task dependency chain functions
   isTaskBlocked,
   findTaskById,
+  acquireTaskLockInMemory,
+  releaseTaskLockInMemory,
   acquireTaskLock,
   releaseTaskLock,
   getDownstreamTasks,
@@ -220,6 +223,44 @@ describe("updateTaskStatus", () => {
     assert.equal(task.reviewStatus, "approved");
     assert.equal(task.reviewReason, "looks good");
   });
+
+  it("returns success: true for non-blocked tasks", () => {
+    const board = createEmptyBoard();
+    const project = createProject(board, { name: "T", request: "r" });
+    const task = addTask(project, { trackId: "t", label: "L" });
+    const result = updateTaskStatus(task, "dispatched", {}, board);
+    assert.equal(result.success, true);
+    assert.equal(task.status, "dispatched");
+  });
+
+  it("returns success: false with blocked: true for blocked tasks", () => {
+    const board = createEmptyBoard();
+    const project = createProject(board, { name: "T", request: "r" });
+    const blocker = addTask(project, { trackId: "blocker", label: "Blocker" });
+    const task = addTask(project, { trackId: "t", label: "L", blockedBy: [blocker.id] });
+    
+    // Blocker is still pending, so task is blocked
+    const result = updateTaskStatus(task, "dispatched", {}, board);
+    assert.equal(result.success, false);
+    assert.equal(result.blocked, true);
+    assert.ok(result.error?.includes("blocked"));
+    assert.equal(task.status, "pending"); // Status unchanged
+  });
+
+  it("allows dispatch after blocker completes", () => {
+    const board = createEmptyBoard();
+    const project = createProject(board, { name: "T", request: "r" });
+    const blocker = addTask(project, { trackId: "blocker", label: "Blocker" });
+    const task = addTask(project, { trackId: "t", label: "L", blockedBy: [blocker.id] });
+    
+    // Complete the blocker
+    updateTaskStatus(blocker, "completed");
+    
+    // Now task should be dispatchable
+    const result = updateTaskStatus(task, "dispatched", {}, board);
+    assert.equal(result.success, true);
+    assert.equal(task.status, "dispatched");
+  });
 });
 
 // ── advanceProjectStatus ──────────────────────────────────────────────────
@@ -276,13 +317,13 @@ describe("advanceProjectStatus", () => {
     assert.equal(project.status, "failed");
   });
 
-  it("some tasks still pending → project pending", () => {
+  it("some tasks still pending in plan stage → project planning", () => {
     const board = createEmptyBoard();
     const project = createProject(board, { name: "T", request: "r" });
     addTask(project, { trackId: "a", label: "A" });
     addTask(project, { trackId: "b", label: "B" });
     advanceProjectStatus(project);
-    assert.equal(project.status, "pending");
+    assert.equal(project.status, "planning");
   });
 
   it("empty tasks → project pending", () => {
@@ -564,13 +605,13 @@ describe("Task Dependency Chain", () => {
     });
   });
 
-  describe("acquireTaskLock / releaseTaskLock", () => {
+  describe("acquireTaskLock / releaseTaskLock (in-memory)", () => {
     it("acquires lock for unlocked task", () => {
       const board = createEmptyBoard();
       const project = createProject(board, { name: "P", request: "r" });
       const task = addTask(project, { trackId: "t", label: "Task" });
 
-      const result = acquireTaskLock(board, task.id, "agent-1");
+      const result = acquireTaskLockInMemory(board, task.id, "agent-1");
       assert.equal(result, true);
       assert.equal(task.lockedBy, "agent-1");
       assert.ok(task.lockedAt);
@@ -581,8 +622,8 @@ describe("Task Dependency Chain", () => {
       const project = createProject(board, { name: "P", request: "r" });
       const task = addTask(project, { trackId: "t", label: "Task" });
 
-      acquireTaskLock(board, task.id, "agent-1");
-      const result = acquireTaskLock(board, task.id, "agent-1");
+      acquireTaskLockInMemory(board, task.id, "agent-1");
+      const result = acquireTaskLockInMemory(board, task.id, "agent-1");
       assert.equal(result, true);
     });
 
@@ -591,8 +632,8 @@ describe("Task Dependency Chain", () => {
       const project = createProject(board, { name: "P", request: "r" });
       const task = addTask(project, { trackId: "t", label: "Task" });
 
-      acquireTaskLock(board, task.id, "agent-1");
-      const result = acquireTaskLock(board, task.id, "agent-2");
+      acquireTaskLockInMemory(board, task.id, "agent-1");
+      const result = acquireTaskLockInMemory(board, task.id, "agent-2");
       assert.equal(result, false);
       assert.equal(task.lockedBy, "agent-1");
     });
@@ -602,15 +643,15 @@ describe("Task Dependency Chain", () => {
       const project = createProject(board, { name: "P", request: "r" });
       const task = addTask(project, { trackId: "t", label: "Task" });
 
-      acquireTaskLock(board, task.id, "agent-1");
-      releaseTaskLock(board, task.id);
+      acquireTaskLockInMemory(board, task.id, "agent-1");
+      releaseTaskLockInMemory(board, task.id);
       assert.equal(task.lockedBy, undefined);
       assert.equal(task.lockedAt, undefined);
     });
 
     it("fails gracefully for non-existent task", () => {
       const board = createEmptyBoard();
-      const result = acquireTaskLock(board, "nonexistent", "agent-1");
+      const result = acquireTaskLockInMemory(board, "nonexistent", "agent-1");
       assert.equal(result, false);
     });
   });
@@ -727,7 +768,7 @@ describe("Task Dependency Chain", () => {
       const board = createEmptyBoard();
       const project = createProject(board, { name: "P", request: "r" });
       const taskA = addTask(project, { trackId: "t1", label: "Task A" });
-      acquireTaskLock(board, taskA.id, "agent-1");
+      acquireTaskLockInMemory(board, taskA.id, "agent-1");
 
       const ready = getReadyTasks(project, board);
       assert.equal(ready.length, 0);
@@ -742,5 +783,284 @@ describe("Task Dependency Chain", () => {
       const ready = getReadyTasks(project, board);
       assert.equal(ready.length, 0);
     });
+  });
+});
+
+// ── CAS-based Task Lock Functions ───────────────────────────────────────
+
+describe("acquireTaskLock / releaseTaskLock (CAS file-based)", () => {
+  let testDir: string;
+
+  before(() => {
+    testDir = join(tmpdir(), `task-board-cas-lock-test-${Date.now()}`);
+    mkdirSync(testDir, { recursive: true });
+  });
+
+  after(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it("acquires lock for unlocked task", () => {
+    const board = createEmptyBoard();
+    const project = createProject(board, { name: "P", request: "r" });
+    const task = addTask(project, { trackId: "t", label: "Task" });
+    saveBoard(testDir, board);
+
+    const result = acquireTaskLock(testDir, task.id, "agent-1");
+    assert.equal(result.success, true);
+    assert.ok(result.currentVersion);
+
+    // Verify lock was persisted
+    const reloaded = loadBoard(testDir);
+    const reloadedTask = reloaded.projects[0].tasks[0];
+    assert.equal(reloadedTask.lockedBy, "agent-1");
+    assert.ok(reloadedTask.lockedAt);
+    assert.equal(reloadedTask.lockVersion, 1);
+  });
+
+  it("allows re-entry by same agent", () => {
+    const board = createEmptyBoard();
+    const project = createProject(board, { name: "P", request: "r" });
+    const task = addTask(project, { trackId: "t", label: "Task" });
+    saveBoard(testDir, board);
+
+    acquireTaskLock(testDir, task.id, "agent-1");
+    const result = acquireTaskLock(testDir, task.id, "agent-1");
+    assert.equal(result.success, true);
+  });
+
+  it("denies lock when held by different agent", () => {
+    const board = createEmptyBoard();
+    const project = createProject(board, { name: "P", request: "r" });
+    const task = addTask(project, { trackId: "t", label: "Task" });
+    saveBoard(testDir, board);
+
+    acquireTaskLock(testDir, task.id, "agent-1");
+    const result = acquireTaskLock(testDir, task.id, "agent-2");
+    assert.equal(result.success, false);
+    assert.ok(result.reason?.includes("agent-1"));
+  });
+
+  it("releases lock with holder validation", () => {
+    const board = createEmptyBoard();
+    const project = createProject(board, { name: "P", request: "r" });
+    const task = addTask(project, { trackId: "t", label: "Task" });
+    saveBoard(testDir, board);
+
+    acquireTaskLock(testDir, task.id, "agent-1");
+    const released = releaseTaskLock(testDir, task.id, "agent-1");
+    assert.equal(released, true);
+
+    // Verify lock was released
+    const reloaded = loadBoard(testDir);
+    const reloadedTask = reloaded.projects[0].tasks[0];
+    assert.equal(reloadedTask.lockedBy, undefined);
+    assert.equal(reloadedTask.lockedAt, undefined);
+  });
+
+  it("denies release by non-holder", () => {
+    const board = createEmptyBoard();
+    const project = createProject(board, { name: "P", request: "r" });
+    const task = addTask(project, { trackId: "t", label: "Task" });
+    saveBoard(testDir, board);
+
+    acquireTaskLock(testDir, task.id, "agent-1");
+    const released = releaseTaskLock(testDir, task.id, "agent-2");
+    assert.equal(released, false);
+
+    // Verify lock is still held
+    const reloaded = loadBoard(testDir);
+    const reloadedTask = reloaded.projects[0].tasks[0];
+    assert.equal(reloadedTask.lockedBy, "agent-1");
+  });
+
+  it("detects concurrent modification via CAS", () => {
+    const board = createEmptyBoard();
+    const project = createProject(board, { name: "P", request: "r" });
+    const task = addTask(project, { trackId: "t", label: "Task" });
+    saveBoard(testDir, board);
+
+    // First acquisition
+    const result1 = acquireTaskLock(testDir, task.id, "agent-1");
+    assert.equal(result1.success, true);
+    const versionAfterFirst = result1.currentVersion;
+
+    // Simulate concurrent modification: another process acquires lock
+    // (in practice, this would be agent-1 releasing first, then agent-2 acquiring)
+    releaseTaskLock(testDir, task.id, "agent-1");
+    acquireTaskLock(testDir, task.id, "agent-2");
+
+    // Now try CAS with stale version
+    const staleResult = acquireTaskLock(testDir, task.id, "agent-1", versionAfterFirst);
+    assert.equal(staleResult.success, false);
+    assert.ok(staleResult.reason?.includes("version mismatch"));
+  });
+
+  it("fails gracefully for non-existent task", () => {
+    const board = createEmptyBoard();
+    saveBoard(testDir, board);
+
+    const result = acquireTaskLock(testDir, "nonexistent", "agent-1");
+    assert.equal(result.success, false);
+    assert.ok(result.reason?.includes("not found"));
+  });
+
+  it("increments lockVersion on each operation", () => {
+    const board = createEmptyBoard();
+    const project = createProject(board, { name: "P", request: "r" });
+    const task = addTask(project, { trackId: "t", label: "Task" });
+    saveBoard(testDir, board);
+
+    // Initial: version should be 0
+    const r1 = acquireTaskLock(testDir, task.id, "agent-1");
+    assert.equal(r1.currentVersion, 1);
+
+    // Re-entry: version increments
+    const r2 = acquireTaskLock(testDir, task.id, "agent-1");
+    assert.equal(r2.currentVersion, 2);
+
+    // Release: version increments
+    releaseTaskLock(testDir, task.id, "agent-1");
+
+    const reloaded = loadBoard(testDir);
+    const reloadedTask = reloaded.projects[0].tasks[0];
+    assert.equal(reloadedTask.lockVersion, 3);
+  });
+});
+
+// ── Optimistic Locking with Version Check ───────────────────────────────────────
+
+describe("saveBoardWithVersionCheck", () => {
+  it("saves successfully when version matches", () => {
+    const testDir = join(tmpdir(), `task-board-version-test-${Date.now()}-${Math.random()}`);
+    mkdirSync(testDir, { recursive: true });
+    
+    const board = createEmptyBoard();
+    createProject(board, { name: "Project A", request: "do stuff" });
+
+    const result = saveBoardWithVersionCheck(testDir, board, board.version);
+
+    assert.equal(result.success, true);
+    assert.equal(result.conflict, false);
+    assert.equal(result.currentVersion, 2); // version incremented from 1 to 2
+    
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it("increments version on successful save", () => {
+    const testDir = join(tmpdir(), `task-board-version-test-${Date.now()}-${Math.random()}`);
+    mkdirSync(testDir, { recursive: true });
+
+    const board = createEmptyBoard();
+    saveBoardWithVersionCheck(testDir, board, board.version);
+
+    const loaded = loadBoard(testDir);
+    assert.equal(loaded.version, 2);
+
+    // Second save
+    const result = saveBoardWithVersionCheck(testDir, loaded, loaded.version);
+    assert.equal(result.success, true);
+    assert.equal(result.currentVersion, 3);
+    
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it("detects conflict when version does not match", () => {
+    const testDir = join(tmpdir(), `task-board-version-test-${Date.now()}-${Math.random()}`);
+    mkdirSync(testDir, { recursive: true });
+
+    // Create and save initial board
+    const board1 = createEmptyBoard();
+    createProject(board1, { name: "Project 1", request: "first" });
+    saveBoardWithVersionCheck(testDir, board1, board1.version);
+
+    // Simulate concurrent modification: another process loads and saves
+    const board2 = loadBoard(testDir);
+    createProject(board2, { name: "Project 2", request: "second" });
+    saveBoardWithVersionCheck(testDir, board2, board2.version);
+
+    // Now try to save board1 again (with stale version)
+    createProject(board1, { name: "Project 3", request: "third" });
+    const result = saveBoardWithVersionCheck(testDir, board1, 1); // stale version
+
+    assert.equal(result.success, false);
+    assert.equal(result.conflict, true);
+    assert.equal(result.expectedVersion, 1);
+    assert.equal(result.currentVersion, 3); // was incremented by board2 save
+    
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it("preserves data on successful save", () => {
+    const testDir = join(tmpdir(), `task-board-version-test-${Date.now()}-${Math.random()}`);
+    mkdirSync(testDir, { recursive: true });
+
+    const board = createEmptyBoard();
+    const project = createProject(board, { name: "Test Project", request: "test" });
+    addTask(project, { trackId: "t1", label: "Task 1" });
+
+    saveBoardWithVersionCheck(testDir, board, board.version);
+
+    const loaded = loadBoard(testDir);
+    assert.equal(loaded.projects.length, 1);
+    assert.equal(loaded.projects[0].name, "Test Project");
+    assert.equal(loaded.projects[0].tasks.length, 1);
+    
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it("does not overwrite file on conflict", () => {
+    const testDir = join(tmpdir(), `task-board-version-test-${Date.now()}-${Math.random()}`);
+    mkdirSync(testDir, { recursive: true });
+
+    // Create and save initial board
+    const board1 = createEmptyBoard();
+    createProject(board1, { name: "Original", request: "original" });
+    saveBoardWithVersionCheck(testDir, board1, board1.version);
+
+    // Another process modifies
+    const board2 = loadBoard(testDir);
+    board2.projects[0].name = "Modified";
+    saveBoardWithVersionCheck(testDir, board2, board2.version);
+
+    // Try conflicting save
+    board1.projects[0].name = "Conflict";
+    saveBoardWithVersionCheck(testDir, board1, 1); // stale version
+
+    // Verify file has "Modified", not "Conflict" or "Original"
+    const finalBoard = loadBoard(testDir);
+    assert.equal(finalBoard.projects[0].name, "Modified");
+    
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it("handles new board (version 1) correctly", () => {
+    const testDir = join(tmpdir(), `task-board-version-test-${Date.now()}-${Math.random()}`);
+    mkdirSync(testDir, { recursive: true });
+
+    const board = createEmptyBoard();
+    const result = saveBoardWithVersionCheck(testDir, board, 1);
+
+    assert.equal(result.success, true);
+    assert.equal(result.currentVersion, 2);
+    
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it("returns conflict for empty dir with wrong expected version", () => {
+    const emptyDir = join(tmpdir(), `task-board-version-empty-${Date.now()}-${Math.random()}`);
+    mkdirSync(emptyDir, { recursive: true });
+
+    const board = createEmptyBoard();
+    // Try to save with wrong expected version (should be 1 for new board)
+    const result = saveBoardWithVersionCheck(emptyDir, board, 5);
+
+    // Since loadBoard returns version 1 for empty, this should conflict
+    assert.equal(result.success, false);
+    assert.equal(result.conflict, true);
+    assert.equal(result.currentVersion, 1);
+    assert.equal(result.expectedVersion, 5);
+
+    rmSync(emptyDir, { recursive: true, force: true });
   });
 });

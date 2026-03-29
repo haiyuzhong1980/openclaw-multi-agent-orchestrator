@@ -1,6 +1,7 @@
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { join } from "node:path";
+import { loggers, ErrorCode } from "./errors.ts";
 
 export interface TopicHeat {
   topic: string;
@@ -52,7 +53,8 @@ export function loadTopTopics(sharedRoot: string, limit?: number): TopicHeat[] {
     return result
       .sort((a, b) => b.importance - a.importance)
       .slice(0, limit ?? 20);
-  } catch {
+  } catch (error) {
+    loggers.ofmsBridge.error(`Failed to load top topics`, error, { sharedRoot });
     return [];
   }
 }
@@ -91,7 +93,8 @@ export function feedbackToOfms(params: {
   if (!existsSync(pendingDir)) {
     try {
       mkdirSync(pendingDir, { recursive: true });
-    } catch {
+    } catch (error) {
+      loggers.ofmsBridge.error(`Failed to create pending directory`, error, { path: pendingDir });
       return 0;
     }
   }
@@ -136,8 +139,8 @@ export function feedbackToOfms(params: {
     try {
       writeFileSync(filePath, content, "utf-8");
       enqueued++;
-    } catch {
-      /* skip */
+    } catch (error) {
+      loggers.ofmsBridge.warn(`Failed to write feedback item`, { file: fileName, error: String(error) });
     }
   }
 

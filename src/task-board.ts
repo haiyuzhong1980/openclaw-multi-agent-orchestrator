@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from "node:fs";
 import { join } from "node:path";
+import { loggers, ErrorCode, createError } from "./errors.ts";
 
 export type ProjectStatus = "pending" | "planning" | "dispatching" | "running" | "reviewing" | "done" | "failed";
 export type TaskStatus = "pending" | "dispatched" | "running" | "completed" | "failed" | "approved" | "rejected";
@@ -30,6 +31,9 @@ export interface Task {
   // M5: Task locking
   lockedBy?: string;    // Agent ID that currently holds the lock
   lockedAt?: string;    // Timestamp when the lock was acquired
+  // CAS (Compare-And-Swap) lock version for atomic lock acquisition
+  // Incremented on each successful lock acquisition, used to detect concurrent modifications
+  lockVersion?: number; // Lock version for CAS-based atomic operations
 }
 
 export interface Project {
@@ -55,18 +59,81 @@ export interface TaskBoard {
 }
 
 const BOARD_FILE = "task-board.json";
+const BOARD_BACKUP_FILE = "task-board.json.bak";
 
 export function createEmptyBoard(): TaskBoard {
   return { projects: [], version: 1 };
 }
 
-export function loadBoard(sharedRoot: string): TaskBoard {
+/**
+ * Result of loadBoardWithRecovery operation.
+ * Contains the loaded board, plus error info if recovery was needed.
+ */
+export interface LoadBoardResult {
+  board: TaskBoard;
+  error?: string;
+  recovered?: boolean;
+  backupPath?: string;
+}
+
+/**
+ * Create a backup of the board file before a potentially destructive operation.
+ * Returns the backup file path, or undefined if backup failed.
+ */
+function createBackup(sharedRoot: string): string | undefined {
   const filePath = join(sharedRoot, BOARD_FILE);
+  const backupPath = join(sharedRoot, BOARD_BACKUP_FILE);
+  
   if (!existsSync(filePath)) {
-    return createEmptyBoard();
+    return undefined;
   }
+  
   try {
+    // Copy to backup with timestamp suffix for uniqueness
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const timestampedBackup = `${backupPath}.${timestamp}`;
     const raw = readFileSync(filePath, "utf-8");
+    writeFileSync(timestampedBackup, raw, "utf-8");
+    return timestampedBackup;
+  } catch (error) {
+    // Backup failed - log but don't throw
+    loggers.taskBoard.error(`Failed to create backup of ${filePath}`, error, { code: ErrorCode.BACKUP_FAILED });
+    return undefined;
+  }
+}
+
+/**
+ * Load board with data protection and recovery support.
+ * 
+ * On parse failure:
+ * 1. Backs up the corrupted file with timestamp
+ * 2. Returns empty board with error info
+ * 3. Sets recovered=true if a backup exists and was used
+ * 
+ * @param sharedRoot - Directory containing the board file
+ * @returns LoadBoardResult with board and error info
+ */
+export function loadBoardWithRecovery(sharedRoot: string): LoadBoardResult {
+  const filePath = join(sharedRoot, BOARD_FILE);
+  const backupPath = join(sharedRoot, BOARD_BACKUP_FILE);
+  
+  if (!existsSync(filePath)) {
+    return { board: createEmptyBoard() };
+  }
+  
+  let raw: string;
+  try {
+    raw = readFileSync(filePath, "utf-8");
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    console.error(`[task-board] Failed to read board file: ${errorMsg}`);
+    return { 
+      board: createEmptyBoard(), 
+      error: `Failed to read board file: ${errorMsg}` 
+    };
+  }
+  
+  try {
     const parsed = JSON.parse(raw) as TaskBoard;
     // Migrate old board data that may lack sprint pipeline fields
     for (const project of parsed.projects) {
@@ -77,12 +144,53 @@ export function loadBoard(sharedRoot: string): TaskBoard {
         if (!task.blockedBy) task.blockedBy = [];
         if (!task.blocks) task.blocks = [];
         // lockedBy and lockedAt are optional, no migration needed
+        // lockVersion defaults to 0 when not present (backward compatible)
+        if (task.lockVersion === undefined) task.lockVersion = 0;
       }
     }
-    return parsed;
-  } catch {
-    return createEmptyBoard();
+    return { board: parsed };
+  } catch (parseErr) {
+    const errorMsg = parseErr instanceof Error ? parseErr.message : String(parseErr);
+    console.error(`[task-board] JSON parse failed, creating backup: ${errorMsg}`);
+    
+    // Create backup of corrupted file
+    const backupFilePath = createBackup(sharedRoot);
+    
+    // Try to load from the most recent backup
+    if (existsSync(backupPath)) {
+      try {
+        const backupRaw = readFileSync(backupPath, "utf-8");
+        const backupParsed = JSON.parse(backupRaw) as TaskBoard;
+        console.warn(`[task-board] Recovered from backup: ${backupPath}`);
+        return {
+          board: backupParsed,
+          error: `JSON parse failed: ${errorMsg}. Recovered from backup.`,
+          recovered: true,
+          backupPath: backupFilePath,
+        };
+      } catch (backupError) {
+        // Backup also failed to parse
+        loggers.taskBoard.error(`Backup file also corrupted`, backupError, { path: backupPath });
+      }
+    }
+    
+    return {
+      board: createEmptyBoard(),
+      error: `JSON parse failed: ${errorMsg}. No valid backup available.`,
+      recovered: false,
+      backupPath: backupFilePath,
+    };
   }
+}
+
+/**
+ * Load the task board from disk.
+ * This is a convenience wrapper that returns just the board for backward compatibility.
+ * For error handling and recovery info, use loadBoardWithRecovery() instead.
+ */
+export function loadBoard(sharedRoot: string): TaskBoard {
+  const result = loadBoardWithRecovery(sharedRoot);
+  return result.board;
 }
 
 export function saveBoard(sharedRoot: string, board: TaskBoard): void {
@@ -93,6 +201,60 @@ export function saveBoard(sharedRoot: string, board: TaskBoard): void {
   const tmpPath = filePath + ".tmp";
   writeFileSync(tmpPath, JSON.stringify(board, null, 2), "utf-8");
   renameSync(tmpPath, filePath);
+}
+
+/**
+ * Result of saveBoardWithVersionCheck operation.
+ */
+export interface SaveBoardResult {
+  success: boolean;
+  conflict: boolean;
+  currentVersion?: number;
+  expectedVersion?: number;
+}
+
+/**
+ * Save board with optimistic locking using version check.
+ * This prevents data loss when multiple processes try to modify the board concurrently.
+ *
+ * Algorithm:
+ * 1. Read the current board from disk
+ * 2. If current version != expected version, return conflict
+ * 3. Increment version and save atomically
+ *
+ * @param sharedRoot - The directory containing the board file
+ * @param board - The modified board to save
+ * @param expectedVersion - The version the board had when loaded
+ * @returns SaveBoardResult indicating success or conflict
+ */
+export function saveBoardWithVersionCheck(
+  sharedRoot: string,
+  board: TaskBoard,
+  expectedVersion: number,
+): SaveBoardResult {
+  // Read current board from disk
+  const currentBoard = loadBoard(sharedRoot);
+
+  // Check for version conflict
+  if (currentBoard.version !== expectedVersion) {
+    return {
+      success: false,
+      conflict: true,
+      currentVersion: currentBoard.version,
+      expectedVersion,
+    };
+  }
+
+  // Increment version and save
+  board.version = expectedVersion + 1;
+  saveBoard(sharedRoot, board);
+
+  return {
+    success: true,
+    conflict: false,
+    currentVersion: board.version,
+    expectedVersion,
+  };
 }
 
 export function generateTaskId(): string {
@@ -155,6 +317,15 @@ export function addTask(
   return task;
 }
 
+/**
+ * Result of updateTaskStatus operation.
+ */
+export interface UpdateTaskStatusResult {
+  success: boolean;
+  error?: string;
+  blocked?: boolean;
+}
+
 export function updateTaskStatus(
   task: Task,
   status: TaskStatus,
@@ -167,13 +338,18 @@ export function updateTaskStatus(
     reviewReason?: string;
   },
   board?: TaskBoard,
-): void {
+): UpdateTaskStatusResult {
   // M5-08: Check dependencies before dispatching
   if (status === "dispatched" && board) {
     if (isTaskBlocked(board, task)) {
-      // Cannot dispatch a blocked task - leave status unchanged
-      // The caller should check isTaskBlocked before calling updateTaskStatus
-      return;
+      // Cannot dispatch a blocked task - return error
+      const blockingTasks = task.blockedBy
+        .map((id) => findTaskById(board, id))
+        .filter((t) => t && t.status !== "completed" && t.status !== "approved");
+      const blockingIds = blockingTasks.map((t) => t?.id).filter(Boolean).join(", ");
+      const errorMsg = `Task ${task.id} is blocked by incomplete dependencies: ${blockingIds}`;
+      console.error(`[task-board] ${errorMsg}`);
+      return { success: false, blocked: true, error: errorMsg };
     }
   }
 
@@ -204,63 +380,222 @@ export function updateTaskStatus(
       }
     }
   }
+
+  return { success: true };
 }
 
 const SPRINT_STAGE_ORDER: SprintStage[] = ["plan", "build", "review", "test", "ship"];
 
-export function advanceProjectStatus(project: Project): void {
-  const tasks = project.tasks;
-  if (tasks.length === 0) {
-    project.status = "pending";
-    project.updatedAt = new Date().toISOString();
-    return;
-  }
+// ============================================================================
+// ProjectStatus State Machine Definition
+// ============================================================================
 
+/**
+ * Valid state transitions for ProjectStatus.
+ * Each key maps to an array of valid next states.
+ * 
+ * State flow:
+ * pending -> planning (project initialized, planning phase starts)
+ * planning -> dispatching (planning complete, ready to dispatch tasks)
+ * dispatching -> running (tasks dispatched, execution begins)
+ * running -> running (tasks in progress, can stay in running)
+ * running -> reviewing (all tasks done, awaiting review)
+ * running -> failed (critical failure during execution)
+ * reviewing -> done (all tasks approved)
+ * reviewing -> failed (tasks rejected and retries exhausted)
+ * failed -> dispatching (can retry from dispatching)
+ * done -> done (terminal state)
+ */
+export const VALID_PROJECT_TRANSITIONS: Record<ProjectStatus, ProjectStatus[]> = {
+  pending: ["planning"],
+  planning: ["dispatching", "failed"],
+  dispatching: ["running", "planning", "failed"],
+  running: ["running", "reviewing", "failed"],
+  reviewing: ["done", "failed", "dispatching"],
+  done: [],
+  failed: ["dispatching", "planning"],
+};
+
+/**
+ * Error class for invalid state transitions.
+ */
+export class InvalidStateTransitionError extends Error {
+  public readonly from: ProjectStatus;
+  public readonly to: ProjectStatus;
+
+  constructor(from: ProjectStatus, to: ProjectStatus, message?: string) {
+    super(message ?? `Invalid transition from '${from}' to '${to}'`);
+    this.name = "InvalidStateTransitionError";
+    this.from = from;
+    this.to = to;
+  }
+}
+
+/**
+ * Check if a state transition is valid according to the state machine.
+ */
+export function isValidTransition(from: ProjectStatus, to: ProjectStatus): boolean {
+  const validTargets = VALID_PROJECT_TRANSITIONS[from];
+  return validTargets.includes(to);
+}
+
+/**
+ * Get valid next states for a given status.
+ */
+export function getValidNextStates(status: ProjectStatus): ProjectStatus[] {
+  return [...VALID_PROJECT_TRANSITIONS[status]];
+}
+
+/**
+ * Attempt to transition project status with validation.
+ * Throws InvalidStateTransitionError if transition is invalid.
+ */
+export function transitionProjectStatus(
+  project: Project,
+  newStatus: ProjectStatus,
+  options?: { force?: boolean },
+): { success: boolean; previousStatus: ProjectStatus } {
+  const previousStatus = project.status;
+  
+  // Allow same-status transitions (no-op)
+  if (previousStatus === newStatus) {
+    return { success: true, previousStatus };
+  }
+  
+  // Validate transition unless force is enabled
+  if (!options?.force && !isValidTransition(previousStatus, newStatus)) {
+    throw new InvalidStateTransitionError(previousStatus, newStatus);
+  }
+  
+  project.status = newStatus;
+  project.updatedAt = new Date().toISOString();
+  
+  return { success: true, previousStatus };
+}
+
+/**
+ * Determine the appropriate project status based on task states.
+ * This is the core logic that computes what status the project should have.
+ */
+export function computeProjectStatus(project: Project): ProjectStatus {
+  const tasks = project.tasks;
+  const hasStageAssignments = tasks.some((t) => t.stage !== undefined);
+  const currentStage = project.currentStage ?? "plan";
+  const currentStageIndex = SPRINT_STAGE_ORDER.indexOf(currentStage);
+  const isLastStage = currentStageIndex >= SPRINT_STAGE_ORDER.length - 1;
+  
+  // No tasks means still pending
+  if (tasks.length === 0) {
+    return "pending";
+  }
+  
+  // All approved = done (after all stages complete)
   const allApproved = tasks.every((t) => t.status === "approved");
   if (allApproved) {
-    // If tasks have stage assignments, check whether the current sprint stage is complete
-    // and advance to the next stage. Only mark "done" when at the last stage (or no stage tags).
-    const hasStageAssignments = tasks.some((t) => t.stage !== undefined);
-    if (hasStageAssignments && isStageComplete(project)) {
-      const nextStage = advanceStage(project);
-      if (nextStage === null) {
-        project.status = "done";
-      }
-    } else if (!hasStageAssignments) {
-      project.status = "done";
+    if (!hasStageAssignments) {
+      return "done";
     }
-    project.updatedAt = new Date().toISOString();
-    return;
-  }
 
+    if (isLastStage) {
+      return "done";
+    }
+
+    return currentStage === "plan" ? "planning" : "dispatching";
+  }
+  
+  // Any active tasks = running
   const anyActive = tasks.some((t) => t.status === "dispatched" || t.status === "running");
   if (anyActive) {
-    project.status = "running";
-    project.updatedAt = new Date().toISOString();
-    return;
+    return "running";
   }
-
+  
+  // Check terminal states
   const allDone = tasks.every(
     (t) => t.status === "completed" || t.status === "failed" || t.status === "approved" || t.status === "rejected",
   );
+  
   if (allDone) {
     // Check if any task is rejected with no more retries
     const exhausted = tasks.some(
       (t) => (t.status === "failed" || t.status === "rejected") && t.retryCount >= t.maxRetry,
     );
     if (exhausted) {
-      project.status = "failed";
-    } else {
-      project.status = "reviewing";
+      return "failed";
     }
-    project.updatedAt = new Date().toISOString();
-    return;
+    
+    // Has completed tasks awaiting review
+    const hasCompletedTasks = tasks.some(
+      (t) => t.status === "completed" || t.status === "rejected",
+    );
+    if (hasCompletedTasks) {
+      return "reviewing";
+    }
+    
   }
-
-  // Some tasks still pending
+  
+  // Check for dispatching state (some dispatched, none running)
+  const anyDispatched = tasks.some((t) => t.status === "dispatched");
+  const noneRunning = !tasks.some((t) => t.status === "running");
+  if (anyDispatched && noneRunning) {
+    return "dispatching";
+  }
+  
+  // Some tasks still pending - determine if planning or dispatching
   const anyPending = tasks.some((t) => t.status === "pending");
   if (anyPending) {
-    project.status = "pending";
+    // If we have any tasks with blockedBy dependencies that aren't satisfied,
+    // or we're in the plan stage, we're planning
+    const currentStage = project.currentStage ?? "plan";
+    if (currentStage === "plan" && !tasks.some((t) => t.status !== "pending")) {
+      return "planning";
+    }
+    
+    // If no tasks dispatched yet and we're past planning
+    const noneDispatched = !tasks.some((t) => t.status === "dispatched");
+    if (noneDispatched && currentStage !== "plan") {
+      return "dispatching";
+    }
+    
+    return "pending";
+  }
+  
+  // Default to current status if we can't determine
+  return project.status;
+}
+
+export function advanceProjectStatus(project: Project): void {
+  const currentStage = project.currentStage ?? "plan";
+  const currentStageTasks = project.tasks.filter((task) => task.stage === currentStage);
+  const shouldAdvanceStage =
+    currentStageTasks.length > 0 &&
+    currentStageTasks.every((task) => task.status === "approved") &&
+    SPRINT_STAGE_ORDER.indexOf(currentStage) < SPRINT_STAGE_ORDER.length - 1;
+
+  if (shouldAdvanceStage) {
+    advanceStage(project);
+  }
+
+  const newStatus = computeProjectStatus(project);
+  
+  // Only update if status actually changed
+  if (project.status !== newStatus) {
+    try {
+      transitionProjectStatus(project, newStatus);
+    } catch (error) {
+      if (error instanceof InvalidStateTransitionError) {
+        // Log the invalid transition but still update to computed status
+        // This handles edge cases where the computed state should override
+        console.warn(
+          `Project ${project.id}: Override transition from '${error.from}' to '${error.to}'`,
+        );
+        project.status = newStatus;
+        project.updatedAt = new Date().toISOString();
+      } else {
+        throw error;
+      }
+    }
+  } else {
+    // Still update timestamp
     project.updatedAt = new Date().toISOString();
   }
 }
@@ -480,10 +815,124 @@ export function findTaskByLabel(project: Project, label: string): Task | undefin
 }
 
 /**
- * Attempt to acquire a lock on a task for an agent.
- * Returns true if successful, false if already locked by another agent.
+ * Attempt to acquire a lock on a task for an agent using CAS (Compare-And-Swap).
+ * 
+ * CAS Mechanism:
+ * 1. Read current lockVersion
+ * 2. Perform check-then-acquire atomically by version comparison
+ * 3. Only succeed if version hasn't changed (no concurrent modification)
+ * 
+ * Returns:
+ * - { success: true } if lock acquired
+ * - { success: false, reason: string } if failed
+ * 
+ * @param sharedRoot - Root directory for board file (required for file-based CAS)
+ * @param taskId - Task ID to lock
+ * @param agentId - Agent ID requesting the lock
+ * @param expectedVersion - Expected lock version for CAS (optional, uses current if not provided)
  */
-export function acquireTaskLock(board: TaskBoard, taskId: string, agentId: string): boolean {
+export function acquireTaskLock(
+  sharedRoot: string,
+  taskId: string,
+  agentId: string,
+  expectedVersion?: number
+): { success: boolean; reason?: string; currentVersion?: number } {
+  // Load fresh board state for atomic operation
+  const board = loadBoard(sharedRoot);
+  const task = findTaskById(board, taskId);
+  
+  if (!task) {
+    return { success: false, reason: "Task not found" };
+  }
+
+  const currentVersion = task.lockVersion ?? 0;
+
+  // CAS Check: If expectedVersion provided, verify it matches current version
+  // This detects if another process modified the lock between read and write
+  if (expectedVersion !== undefined && expectedVersion !== currentVersion) {
+    return { 
+      success: false, 
+      reason: "Lock version mismatch - concurrent modification detected",
+      currentVersion 
+    };
+  }
+
+  // Already locked by same agent - allow re-entry (idempotent)
+  if (task.lockedBy === agentId) {
+    // Increment version even for re-entry to maintain consistency
+    task.lockVersion = currentVersion + 1;
+    task.lockedAt = new Date().toISOString();
+    saveBoard(sharedRoot, board);
+    return { success: true, currentVersion: task.lockVersion };
+  }
+
+  // Locked by different agent - deny
+  if (task.lockedBy && task.lockedBy !== agentId) {
+    return { 
+      success: false, 
+      reason: `Task already locked by ${task.lockedBy}`,
+      currentVersion 
+    };
+  }
+
+  // Not locked - acquire atomically
+  // CAS: Increment version to invalidate any stale expected versions from other processes
+  task.lockedBy = agentId;
+  task.lockedAt = new Date().toISOString();
+  task.lockVersion = currentVersion + 1;
+  
+  // Persist the change
+  saveBoard(sharedRoot, board);
+  
+  return { success: true, currentVersion: task.lockVersion };
+}
+
+/**
+ * Release a task lock with holder validation.
+ * 
+ * Security: Only the agent that holds the lock can release it.
+ * This prevents accidental or malicious release by other agents.
+ * 
+ * @param sharedRoot - Root directory for board file
+ * @param taskId - Task ID to unlock
+ * @param agentId - Agent ID releasing the lock (must match lock holder)
+ * @returns true if lock released, false if not held by this agent or task not found
+ */
+export function releaseTaskLock(
+  sharedRoot: string,
+  taskId: string,
+  agentId: string
+): boolean {
+  // Load fresh board state for atomic operation
+  const board = loadBoard(sharedRoot);
+  const task = findTaskById(board, taskId);
+  
+  if (!task) {
+    return false;
+  }
+
+  // Security check: Only the lock holder can release
+  if (task.lockedBy && task.lockedBy !== agentId) {
+    // Lock held by different agent - cannot release
+    return false;
+  }
+
+  // Not locked or locked by this agent - release it
+  task.lockedBy = undefined;
+  task.lockedAt = undefined;
+  // Increment version on release to invalidate any pending CAS operations
+  task.lockVersion = (task.lockVersion ?? 0) + 1;
+  
+  saveBoard(sharedRoot, board);
+  return true;
+}
+
+/**
+ * Legacy acquireTaskLock for backward compatibility.
+ * Uses in-memory board without file persistence.
+ * @deprecated Use the file-based acquireTaskLock for proper CAS support
+ */
+export function acquireTaskLockInMemory(board: TaskBoard, taskId: string, agentId: string): boolean {
   const task = findTaskById(board, taskId);
   if (!task) {
     return false;
@@ -499,20 +948,23 @@ export function acquireTaskLock(board: TaskBoard, taskId: string, agentId: strin
     return false;
   }
 
-  // Not locked - acquire
+  // Not locked - acquire (still has race condition, use file-based version for production)
   task.lockedBy = agentId;
   task.lockedAt = new Date().toISOString();
+  task.lockVersion = (task.lockVersion ?? 0) + 1;
   return true;
 }
 
 /**
- * Release a task lock.
+ * Legacy releaseTaskLock for backward compatibility.
+ * @deprecated Use the file-based releaseTaskLock for proper holder validation
  */
-export function releaseTaskLock(board: TaskBoard, taskId: string): void {
+export function releaseTaskLockInMemory(board: TaskBoard, taskId: string): void {
   const task = findTaskById(board, taskId);
   if (task) {
     task.lockedBy = undefined;
     task.lockedAt = undefined;
+    task.lockVersion = (task.lockVersion ?? 0) + 1;
   }
 }
 

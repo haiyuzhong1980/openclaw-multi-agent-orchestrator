@@ -9,6 +9,7 @@ import type { EnforcementState } from "./enforcement-ladder.ts";
 import type { IntentRegistry } from "./intent-registry.ts";
 import { addUserKeyword, pruneSubstringKeywords } from "./user-keywords.ts";
 import type { UserKeywords } from "./user-keywords.ts";
+import { loggers } from "./errors.ts";
 
 export interface EvolutionReport {
   timestamp: string;
@@ -181,7 +182,8 @@ export function loadEvolutionHistory(sharedRoot: string): EvolutionReport[] {
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
     return parsed as EvolutionReport[];
-  } catch {
+  } catch (error) {
+    loggers.evolution.error(`Failed to load evolution history`, error, { path: filePath });
     return [];
   }
 }

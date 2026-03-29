@@ -1,4 +1,5 @@
 import { readFileSync, existsSync } from "node:fs";
+import { loggers } from "./errors.ts";
 
 // ─── OAG Event → OMA Observation ─────────────────────────────────────────────
 
@@ -147,7 +148,8 @@ export function loadUnifiedOagConfig(configPath: string): {
   let raw: unknown;
   try {
     raw = JSON.parse(readFileSync(configPath, 'utf-8'));
-  } catch {
+  } catch (error) {
+    loggers.oagBridge.error(`Failed to load OAG config`, error, { path: configPath });
     return empty;
   }
 

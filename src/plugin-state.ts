@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { createSpawnTracker } from "./spawn-tracker.ts";
 import type { SpawnTracker } from "./spawn-tracker.ts";
-import { loadBoard, saveBoard } from "./task-board.ts";
+import { loadBoard, loadBoardWithRecovery, saveBoard } from "./task-board.ts";
 import type { TaskBoard } from "./task-board.ts";
 import { loadUserKeywords, saveUserKeywords } from "./user-keywords.ts";
 import type { UserKeywords } from "./user-keywords.ts";
@@ -47,9 +47,20 @@ export interface PluginState {
 }
 
 export function createPluginState(sharedRoot: string): PluginState {
-  const board: TaskBoard = existsSync(sharedRoot)
-    ? loadBoard(sharedRoot)
-    : { projects: [], version: 1 };
+  // Load board with recovery support - log any errors
+  let board: TaskBoard;
+  if (existsSync(sharedRoot)) {
+    const result = loadBoardWithRecovery(sharedRoot);
+    board = result.board;
+    if (result.error) {
+      console.warn(`[plugin-state] Board load issue: ${result.error}`);
+      if (result.recovered) {
+        console.warn(`[plugin-state] Successfully recovered from backup`);
+      }
+    }
+  } else {
+    board = { projects: [], version: 1 };
+  }
 
   const userKeywords: UserKeywords = existsSync(sharedRoot)
     ? loadUserKeywords(sharedRoot)

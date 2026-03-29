@@ -1,6 +1,23 @@
-import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, appendFileSync, existsSync, mkdirSync, promises as fs } from "node:fs";
 import { join } from "node:path";
 import { ACTION_VERBS, ESCALATION_SIGNALS, DE_ESCALATION_SIGNALS } from "./constants.ts";
+import { loggers, ErrorCode } from "./errors.ts";
+import { generateObservationId, getHoursAgoCutoff, getDaysAgoCutoff } from "./utils.ts";
+
+// Re-export for backward compatibility
+export { generateObservationId };
+
+/**
+ * Persistence configuration options.
+ */
+export interface PersistenceConfig {
+  /** Flush buffer immediately after each update (default: false) */
+  flushOnUpdate?: boolean;
+  /** Enable periodic flush at specified interval in ms (default: 30000 = 30 seconds) */
+  periodicFlushInterval?: number;
+  /** Enable graceful shutdown hooks (default: true) */
+  enableShutdownHooks?: boolean;
+}
 
 export interface ObservationRecord {
   id: string;                    // unique ID (timestamp + random)
@@ -38,6 +55,7 @@ export interface ObservationStats {
 }
 
 const OBS_FILE = "observation-log.jsonl";
+const INDEX_FILE = "observation-index.json";
 const MAX_AGE_DAYS = 30;
 
 // ACTION_VERBS, ESCALATION_SIGNALS, DE_ESCALATION_SIGNALS imported from constants.ts
@@ -50,13 +68,303 @@ const SATISFACTION_SIGNALS: RegExp[] = [
 let recentBuffer: ObservationRecord[] = [];
 let bufferDirty = false;
 
+// ============================================================================
+// CACHE LAYER for loadRecentObservations
+// ============================================================================
+
+interface ObservationCache {
+  /** Cached records by hour bucket */
+  hourlyBuckets: Map<string, ObservationRecord[]>;
+  /** File modification time when cache was built */
+  fileMtime: number;
+  /** Total records in cache */
+  totalRecords: number;
+  /** Cache hit count for metrics */
+  hitCount: number;
+  /** Cache miss count for metrics */
+  missCount: number;
+}
+
+// Global cache instance
+let observationCache: ObservationCache = {
+  hourlyBuckets: new Map(),
+  fileMtime: 0,
+  totalRecords: 0,
+  hitCount: 0,
+  missCount: 0,
+};
+
 /**
- * Generate a unique observation ID.
+ * Get hour bucket key from timestamp.
+ * Format: YYYY-MM-DD-HH
  */
-export function generateObservationId(): string {
-  const ts = Date.now();
-  const rand = Math.floor(Math.random() * 0xffff).toString(16).padStart(4, "0");
-  return `obs-${ts}-${rand}`;
+function getHourBucket(timestamp: string): string {
+  const date = new Date(timestamp);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}-${String(date.getHours()).padStart(2, "0")}`;
+}
+
+/**
+ * Build cache from file.
+ * Reads the JSONL file and organizes records by hour bucket.
+ */
+function buildCache(filePath: string): void {
+  try {
+    const stat = require("fs").statSync(filePath);
+    const mtime = stat.mtimeMs;
+    
+    // Check if cache is still valid
+    if (observationCache.fileMtime === mtime && observationCache.totalRecords > 0) {
+      return; // Cache is fresh
+    }
+    
+    const raw = readFileSync(filePath, "utf-8");
+    const lines = raw.split("\n").filter((l: string) => l.trim().length > 0);
+    
+    const newBuckets = new Map<string, ObservationRecord[]>();
+    let total = 0;
+    
+    for (const line of lines) {
+      try {
+        const rec = JSON.parse(line) as ObservationRecord;
+        const bucket = getHourBucket(rec.timestamp);
+        
+        if (!newBuckets.has(bucket)) {
+          newBuckets.set(bucket, []);
+        }
+        newBuckets.get(bucket)!.push(rec);
+        total++;
+      } catch {
+        // Skip malformed lines
+      }
+    }
+    
+    observationCache = {
+      hourlyBuckets: newBuckets,
+      fileMtime: mtime,
+      totalRecords: total,
+      hitCount: 0,
+      missCount: 0,
+    };
+  } catch {
+    // File doesn't exist or can't be read - reset cache
+    observationCache = {
+      hourlyBuckets: new Map(),
+      fileMtime: 0,
+      totalRecords: 0,
+      hitCount: 0,
+      missCount: 0,
+    };
+  }
+}
+
+/**
+ * Get cache statistics.
+ */
+export function getCacheStats(): { hitRate: number; totalRecords: number; bucketCount: number } {
+  const total = observationCache.hitCount + observationCache.missCount;
+  return {
+    hitRate: total > 0 ? observationCache.hitCount / total : 0,
+    totalRecords: observationCache.totalRecords,
+    bucketCount: observationCache.hourlyBuckets.size,
+  };
+}
+
+/**
+ * Invalidate the cache.
+ * Call this after modifying the observation file.
+ */
+export function invalidateCache(): void {
+  observationCache.fileMtime = 0;
+}
+
+// ============================================================================
+// Persistence configuration
+// ============================================================================
+
+let persistenceConfig: PersistenceConfig = {
+  flushOnUpdate: false,
+  periodicFlushInterval: 30000,
+  enableShutdownHooks: true,
+};
+
+// Timer and state for periodic flush
+let periodicFlushTimer: ReturnType<typeof setInterval> | null = null;
+let shutdownHooksRegistered = false;
+let currentSharedRoot: string | null = null;
+
+/**
+ * Initialize the observation engine with persistence configuration.
+ * Must be called before any observation operations if you want custom persistence behavior.
+ * 
+ * @param sharedRoot - The shared root directory for observation files
+ * @param config - Persistence configuration options
+ */
+export function initObservationEngine(sharedRoot: string, config?: PersistenceConfig): void {
+  currentSharedRoot = sharedRoot;
+  
+  if (config) {
+    persistenceConfig = { ...persistenceConfig, ...config };
+  }
+  
+  // Register shutdown hooks if enabled
+  if (persistenceConfig.enableShutdownHooks && !shutdownHooksRegistered) {
+    registerShutdownHooks();
+    shutdownHooksRegistered = true;
+  }
+  
+  // Start periodic flush timer if interval > 0
+  if (persistenceConfig.periodicFlushInterval && persistenceConfig.periodicFlushInterval > 0) {
+    startPeriodicFlush();
+  }
+}
+
+/**
+ * Register shutdown hooks to ensure buffer is flushed before exit.
+ */
+function registerShutdownHooks(): void {
+  const flushAndExit = (signal: string) => {
+    if (currentSharedRoot && bufferDirty) {
+      try {
+        flushBuffer(currentSharedRoot);
+      } catch (err) {
+        // Best effort flush - don't throw during shutdown
+        console.error(`[observation-engine] Error flushing during ${signal}:`, err);
+      }
+    }
+    process.exit(0);
+  };
+  
+  // Handle normal exit
+  process.on("exit", () => {
+    if (currentSharedRoot && bufferDirty) {
+      try {
+        flushBuffer(currentSharedRoot);
+      } catch (err) {
+        console.error("[observation-engine] Error flushing on exit:", err);
+      }
+    }
+  });
+  
+  // Handle termination signals
+  process.on("SIGINT", () => flushAndExit("SIGINT"));
+  process.on("SIGTERM", () => flushAndExit("SIGTERM"));
+  
+  // Handle uncaught exceptions - flush before crash
+  process.on("uncaughtException", (err) => {
+    console.error("[observation-engine] Uncaught exception, attempting flush:", err);
+    if (currentSharedRoot && bufferDirty) {
+      try {
+        flushBuffer(currentSharedRoot);
+      } catch (flushErr) {
+        console.error("[observation-engine] Error flushing during exception:", flushErr);
+      }
+    }
+    // Re-throw to let the process crash
+    throw err;
+  });
+}
+
+/**
+ * Start the periodic flush timer.
+ */
+function startPeriodicFlush(): void {
+  if (periodicFlushTimer) {
+    clearInterval(periodicFlushTimer);
+  }
+  
+  const interval = persistenceConfig.periodicFlushInterval ?? 30000;
+  periodicFlushTimer = setInterval(() => {
+    if (currentSharedRoot && bufferDirty) {
+      try {
+        flushBuffer(currentSharedRoot);
+      } catch (err) {
+        console.error("[observation-engine] Error during periodic flush:", err);
+      }
+    }
+  }, interval);
+  
+  // Allow the process to exit even if this timer is active
+  if (periodicFlushTimer.unref) {
+    periodicFlushTimer.unref();
+  }
+}
+
+/**
+ * Stop the periodic flush timer.
+ */
+export function stopPeriodicFlush(): void {
+  if (periodicFlushTimer) {
+    clearInterval(periodicFlushTimer);
+    periodicFlushTimer = null;
+  }
+}
+
+/**
+ * Manually flush the buffer and optionally stop periodic flush.
+ * Call this for graceful shutdown.
+ */
+export function shutdown(sharedRoot?: string): void {
+  const root = sharedRoot ?? currentSharedRoot;
+  if (root && bufferDirty) {
+    flushBuffer(root);
+  }
+  stopPeriodicFlush();
+}
+
+/**
+ * Check if the engine has been initialized.
+ */
+export function isInitialized(): boolean {
+  return currentSharedRoot !== null;
+}
+
+/**
+ * Get current persistence configuration.
+ */
+export function getPersistenceConfig(): Readonly<PersistenceConfig> {
+  return { ...persistenceConfig };
+}
+
+/**
+ * Update persistence configuration at runtime.
+ * Note: Changes to periodicFlushInterval will restart the timer if it's running.
+ * 
+ * @param config - Partial configuration to update
+ */
+export function setPersistenceConfig(config: Partial<PersistenceConfig>): void {
+  const wasPeriodicRunning = periodicFlushTimer !== null;
+  
+  persistenceConfig = { ...persistenceConfig, ...config };
+  
+  // Restart periodic flush if interval changed and timer was running
+  if (wasPeriodicRunning && config.periodicFlushInterval !== undefined) {
+    startPeriodicFlush();
+  }
+}
+
+/**
+ * Force an immediate flush using the tracked sharedRoot.
+ * Useful for manual control over persistence timing.
+ * 
+ * @returns true if flush was performed, false if no sharedRoot or buffer not dirty
+ */
+export function forceFlush(): boolean {
+  if (!currentSharedRoot || !bufferDirty) {
+    return false;
+  }
+  flushBuffer(currentSharedRoot);
+  return true;
+}
+
+/**
+ * Ensure shutdown hooks are registered.
+ * Called automatically when needed if not explicitly initialized.
+ */
+function ensureShutdownHooks(): void {
+  if (persistenceConfig.enableShutdownHooks && !shutdownHooksRegistered) {
+    registerShutdownHooks();
+    shutdownHooksRegistered = true;
+  }
 }
 
 /**
@@ -128,6 +436,16 @@ export function appendObservation(sharedRoot: string, record: ObservationRecord)
     mkdirSync(sharedRoot, { recursive: true });
   }
   appendFileSync(filePath, JSON.stringify(record) + "\n", "utf-8");
+  
+  // Invalidate cache since file changed
+  invalidateCache();
+
+  // Track sharedRoot for shutdown hooks if not already set
+  if (!currentSharedRoot) {
+    currentSharedRoot = sharedRoot;
+    // Auto-register shutdown hooks on first use
+    ensureShutdownHooks();
+  }
 
   // Keep a copy in the buffer for fast in-memory updates
   recentBuffer.push(record);
@@ -166,18 +484,27 @@ export function flushBuffer(sharedRoot: string): void {
         return JSON.stringify(bufferMap.get(rec.id));
       }
       return line;
-    } catch {
+    } catch (error) {
+      loggers.observation.debug(`Failed to parse observation line during flush`, { line: line.slice(0, 50), error: String(error) });
       return line;
     }
   });
 
   writeFileSync(filePath, updated.join("\n") + "\n", "utf-8");
   bufferDirty = false;
+  
+  // Invalidate cache since file changed
+  invalidateCache();
 }
 
 /**
  * Update the most recent observation's outcome (tools called, spawn status).
  * Uses Option A: in-memory buffer with periodic flush.
+ * 
+ * @param sharedRoot - The shared root directory
+ * @param observationId - The observation ID to update
+ * @param outcome - The outcome data to merge
+ * @param immediateFlush - Override config to force immediate flush (optional)
  */
 export function updateObservationOutcome(
   sharedRoot: string,
@@ -187,6 +514,7 @@ export function updateObservationOutcome(
     didSpawnSubagent?: boolean;
     spawnCount?: number;
   },
+  immediateFlush?: boolean,
 ): void {
   const rec = recentBuffer.find((r) => r.id === observationId);
   if (!rec) return;
@@ -203,10 +531,20 @@ export function updateObservationOutcome(
     rec.spawnCount = rec.spawnCount + outcome.spawnCount;
   }
   bufferDirty = true;
+  
+  // Immediate flush if configured or explicitly requested
+  if (immediateFlush === true || (immediateFlush === undefined && persistenceConfig.flushOnUpdate)) {
+    flushBuffer(sharedRoot);
+  }
 }
 
 /**
  * Update the most recent observation's user feedback.
+ * 
+ * @param sharedRoot - The shared root directory
+ * @param observationId - The observation ID to update
+ * @param feedback - The feedback data
+ * @param immediateFlush - Override config to force immediate flush (optional)
  */
 export function updateObservationFeedback(
   sharedRoot: string,
@@ -215,10 +553,12 @@ export function updateObservationFeedback(
     userFollowUp: "satisfied" | "corrected_up" | "corrected_down" | "continued";
     actualTier?: "light" | "tracked" | "delegation";
   },
+  immediateFlush?: boolean,
 ): void {
   const rec = recentBuffer.find((r) => r.id === observationId);
   if (!rec) {
     // Not in buffer — fall back to disk scan of last 50 lines
+    // Note: This fallback path writes directly to disk, so no flush needed
     const filePath = join(sharedRoot, OBS_FILE);
     if (!existsSync(filePath)) return;
     const raw = readFileSync(filePath, "utf-8");
@@ -227,7 +567,8 @@ export function updateObservationFeedback(
     const idx = last50.findIndex((l) => {
       try {
         return (JSON.parse(l) as ObservationRecord).id === observationId;
-      } catch {
+      } catch (error) {
+        loggers.observation.debug(`Failed to parse line during feedback update`, { error: String(error) });
         return false;
       }
     });
@@ -238,6 +579,7 @@ export function updateObservationFeedback(
     last50[idx] = JSON.stringify(target);
     const beginning = lines.slice(0, lines.length - last50.length);
     writeFileSync(filePath, [...beginning, ...last50].join("\n") + "\n", "utf-8");
+    invalidateCache();
     return;
   }
 
@@ -246,16 +588,69 @@ export function updateObservationFeedback(
     rec.actualTier = feedback.actualTier;
   }
   bufferDirty = true;
+  
+  // Immediate flush if configured or explicitly requested
+  if (immediateFlush === true || (immediateFlush === undefined && persistenceConfig.flushOnUpdate)) {
+    flushBuffer(sharedRoot);
+  }
 }
 
 /**
  * Load recent observations (last N hours).
+ * 
+ * OPTIMIZED: Uses an in-memory cache with hour-based bucketing.
+ * Instead of reading the entire file every time, we:
+ * 1. Build a cache organized by hour buckets on first read
+ * 2. Only read from the relevant hour buckets based on the cutoff
+ * 3. Cache is invalidated when the file is modified
+ * 
+ * For large observation files, this can reduce read time from O(n) to O(1)
+ * when the cache is hot.
  */
 export function loadRecentObservations(sharedRoot: string, hours = 24): ObservationRecord[] {
   const filePath = join(sharedRoot, OBS_FILE);
   if (!existsSync(filePath)) return [];
 
-  const cutoff = new Date(Date.now() - hours * 60 * 60 * 1000);
+  const cutoff = getHoursAgoCutoff(hours);
+  
+  // Build or refresh cache
+  buildCache(filePath);
+  
+  // Calculate which hour buckets we need
+  const now = new Date();
+  const records: ObservationRecord[] = [];
+  
+  // Generate hour bucket keys for the requested time range
+  for (let h = 0; h < hours; h++) {
+    const bucketDate = new Date(now.getTime() - h * 60 * 60 * 1000);
+    const bucketKey = getHourBucket(bucketDate.toISOString());
+    
+    const bucket = observationCache.hourlyBuckets.get(bucketKey);
+    if (bucket) {
+      observationCache.hitCount++;
+      for (const rec of bucket) {
+        if (new Date(rec.timestamp) >= cutoff) {
+          records.push(rec);
+        }
+      }
+    } else {
+      observationCache.missCount++;
+    }
+  }
+  
+  // If cache was empty or stale, fall back to full file read
+  if (records.length === 0 && observationCache.totalRecords === 0) {
+    return loadRecentObservationsFallback(filePath, cutoff);
+  }
+
+  return records;
+}
+
+/**
+ * Fallback implementation that reads the entire file.
+ * Used when cache is empty or for backward compatibility.
+ */
+function loadRecentObservationsFallback(filePath: string, cutoff: Date): ObservationRecord[] {
   const raw = readFileSync(filePath, "utf-8");
   const records: ObservationRecord[] = [];
 
@@ -267,8 +662,9 @@ export function loadRecentObservations(sharedRoot: string, hours = 24): Observat
       if (new Date(rec.timestamp) >= cutoff) {
         records.push(rec);
       }
-    } catch {
-      // skip malformed lines
+    } catch (error) {
+      // skip malformed lines but log
+      loggers.observation.debug(`Failed to parse observation line`, { line: trimmed.slice(0, 50), error: String(error) });
     }
   }
 
@@ -335,7 +731,7 @@ export function pruneObservations(sharedRoot: string, maxAgeDays = MAX_AGE_DAYS)
   const filePath = join(sharedRoot, OBS_FILE);
   if (!existsSync(filePath)) return 0;
 
-  const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000);
+  const cutoff = getDaysAgoCutoff(maxAgeDays);
   const raw = readFileSync(filePath, "utf-8");
   const lines = raw.split("\n").filter((l) => l.trim().length > 0);
 
@@ -350,13 +746,15 @@ export function pruneObservations(sharedRoot: string, maxAgeDays = MAX_AGE_DAYS)
       } else {
         kept.push(line);
       }
-    } catch {
+    } catch (error) {
       kept.push(line); // keep malformed lines to avoid data loss
+      loggers.observation.debug(`Kept malformed line during prune`, { line: line.slice(0, 50), error: String(error) });
     }
   }
 
   if (pruned > 0) {
     writeFileSync(filePath, kept.join("\n") + (kept.length > 0 ? "\n" : ""), "utf-8");
+    invalidateCache();
   }
 
   return pruned;

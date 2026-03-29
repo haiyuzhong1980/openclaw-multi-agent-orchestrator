@@ -28,6 +28,25 @@ export const CHINESE_STOP_CHARS = new Set([
   "一个", "没有", "什么",
 ]);
 
+// CHINESE_STOP_WORDS — multi-character stopwords for better phrase filtering
+export const CHINESE_STOP_WORDS = new Set([
+  "这个", "那个", "什么", "怎么", "如何", "为什么", "哪里", "那里",
+  "一个", "一些", "不是", "可以", "可能", "应该", "因为", "所以",
+  "但是", "如果", "虽然", "或者", "而且", "然后", "这样", "那样",
+  "的话", "时候", "地方", "东西", "事情", "问题", "一下", "一点",
+  "没有", "已经", "还是", "只是", "就是", "都是", "或是", "而是",
+]);
+
+// CHINESE_PHRASE_BLACKLIST — meaningless bigram patterns to filter out
+export const CHINESE_PHRASE_BLACKLIST = new Set([
+  "这是", "那是", "不是", "是的", "有的", "我的", "你的", "他的",
+  "就是", "都是", "还是", "或者", "但是", "因为", "所以", "然后",
+  "如果", "虽然", "而且", "或者", "然后", "这样", "那样", "这个",
+  "那个", "什么", "怎么", "如何", "为什么", "哪里", "那里", "一个",
+  "可以", "可能", "应该", "没有", "已经", "只是", "或是", "而是",
+  "一下", "一点", "时候", "地方", "东西", "事情", "问题", "的话",
+]);
+
 // ENGLISH_STOP_WORDS — merged from pattern-discovery.ts and intent-registry.ts (identical)
 export const ENGLISH_STOP_WORDS = new Set([
   "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",

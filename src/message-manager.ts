@@ -10,6 +10,12 @@
 import { existsSync, mkdirSync, writeFileSync, readdirSync, readFileSync, renameSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 import type { TeamMessage, MessageType } from "./types.ts";
+import { loggers, ErrorCode } from "./errors.ts";
+import { sanitizePathPart, generateMessageId } from "./utils.ts";
+
+// Re-export for backward compatibility
+export { generateMessageId };
+export type { MessageType, TeamMessage } from "./types.ts";
 
 const INBOX_DIR = "inbox";
 const PENDING_DIR = "pending";
@@ -25,10 +31,16 @@ export interface MailboxPaths {
 
 /**
  * Get mailbox paths for a specific agent.
+ * Sanitizes teamName and agentId to prevent path injection.
  */
 export function getMailboxPaths(sharedRoot: string, teamName: string | null, agentId: string): MailboxPaths {
-  const teamDir = teamName ? teamName : "_default";
-  const inboxRoot = join(sharedRoot, INBOX_DIR, teamDir, agentId);
+  // Sanitize path components to prevent path injection
+  const teamDir = teamName 
+    ? sanitizePathPart(teamName, "teamName") 
+    : "_default";
+  const safeAgentId = sanitizePathPart(agentId, "agentId");
+  
+  const inboxRoot = join(sharedRoot, INBOX_DIR, teamDir, safeAgentId);
   return {
     inboxRoot,
     pendingPath: join(inboxRoot, PENDING_DIR),
@@ -50,15 +62,6 @@ export function ensureMailbox(paths: MailboxPaths): void {
 }
 
 /**
- * Generate a unique message ID.
- */
-export function generateMessageId(): string {
-  const timestamp = Date.now().toString(36);
-  const random = Math.random().toString(36).slice(2, 8);
-  return `msg-${timestamp}-${random}`;
-}
-
-/**
  * Send a message to an agent's mailbox.
  */
 export function sendMessage(
@@ -74,7 +77,10 @@ export function sendMessage(
   // If broadcast, send to all agents in the team
   if (message.to === null) {
     // For broadcast, we'll store in a special _broadcast directory
-    const teamDir = message.metadata?.teamName as string | null ?? "_default";
+    const rawTeamName = message.metadata?.teamName as string | null;
+    const teamDir = rawTeamName 
+      ? sanitizePathPart(rawTeamName, "teamName") 
+      : "_default";
     const broadcastPath = join(sharedRoot, INBOX_DIR, teamDir, "_broadcast");
     if (!existsSync(broadcastPath)) {
       mkdirSync(broadcastPath, { recursive: true });
@@ -118,8 +124,9 @@ export function getPendingMessages(sharedRoot: string, teamName: string | null, 
     try {
       const content = readFileSync(join(paths.pendingPath, file), "utf-8");
       messages.push(JSON.parse(content) as TeamMessage);
-    } catch {
-      // Skip invalid files
+    } catch (error) {
+      // Skip invalid files but log the error
+      loggers.messageManager.warn(`Failed to parse pending message file: ${file}`, { error: String(error) });
     }
   }
 
@@ -163,7 +170,10 @@ export function markMessageProcessed(
  * Get broadcast messages for a team.
  */
 export function getBroadcastMessages(sharedRoot: string, teamName: string | null): TeamMessage[] {
-  const teamDir = teamName ?? "_default";
+  // Sanitize team name to prevent path injection
+  const teamDir = teamName 
+    ? sanitizePathPart(teamName, "teamName") 
+    : "_default";
   const broadcastPath = join(sharedRoot, INBOX_DIR, teamDir, "_broadcast");
 
   if (!existsSync(broadcastPath)) {
@@ -177,8 +187,9 @@ export function getBroadcastMessages(sharedRoot: string, teamName: string | null
     try {
       const content = readFileSync(join(broadcastPath, file), "utf-8");
       messages.push(JSON.parse(content) as TeamMessage);
-    } catch {
-      // Skip invalid files
+    } catch (error) {
+      // Skip invalid files but log the error
+      loggers.messageManager.warn(`Failed to parse broadcast message file: ${file}`, { error: String(error) });
     }
   }
 
@@ -213,6 +224,63 @@ export function formatMessages(messages: TeamMessage[]): string {
     const time = new Date(msg.timestamp).toLocaleTimeString();
     lines.push(`${icon} [${time}] ${msg.type} from ${msg.from}`);
     lines.push(`   ${msg.content.slice(0, 100)}${msg.content.length > 100 ? "..." : ""}`);
+    lines.push("");
+  }
+
+  return lines.join("\n");
+}
+
+/**
+ * Get processed messages history for an agent.
+ * M7-09: Support for /mao-inbox-history command.
+ */
+export function getMessageHistory(
+  sharedRoot: string,
+  teamName: string | null,
+  agentId: string,
+  limit: number = 20,
+): TeamMessage[] {
+  const paths = getMailboxPaths(sharedRoot, teamName, agentId);
+  if (!existsSync(paths.processedPath)) {
+    return [];
+  }
+
+  const files = readdirSync(paths.processedPath)
+    .filter((f) => f.endsWith(".json"))
+    .slice(0, limit);
+
+  const messages: TeamMessage[] = [];
+
+  for (const file of files) {
+    try {
+      const content = readFileSync(join(paths.processedPath, file), "utf-8");
+      messages.push(JSON.parse(content) as TeamMessage);
+    } catch (error) {
+      // Skip invalid files but log the error
+      loggers.messageManager.warn(`Failed to parse processed message file: ${file}`, { error: String(error) });
+    }
+  }
+
+  // Sort by timestamp (newest first for history)
+  messages.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+
+  return messages;
+}
+
+/**
+ * Format message history for display.
+ */
+export function formatMessageHistory(messages: TeamMessage[]): string {
+  if (messages.length === 0) {
+    return "📭 No message history.";
+  }
+
+  const lines: string[] = [`📜 Message History (${messages.length} processed)`, ""];
+
+  for (const msg of messages) {
+    const time = new Date(msg.timestamp).toLocaleString();
+    lines.push(`✅ [${time}] ${msg.type} from ${msg.from}`);
+    lines.push(`   ${msg.content.slice(0, 80)}${msg.content.length > 80 ? "..." : ""}`);
     lines.push("");
   }
 

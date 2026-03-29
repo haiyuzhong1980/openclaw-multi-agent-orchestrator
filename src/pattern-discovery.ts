@@ -1,5 +1,5 @@
 import type { ObservationRecord } from "./observation-engine.js";
-import { ENGLISH_STOP_WORDS, CHINESE_STOP_CHARS } from "./constants.ts";
+import { ENGLISH_STOP_WORDS, CHINESE_STOP_CHARS, CHINESE_STOP_WORDS, CHINESE_PHRASE_BLACKLIST } from "./constants.ts";
 
 export interface DiscoveredPattern {
   phrase: string;
@@ -23,11 +23,30 @@ export interface DiscoveryResult {
   overallAccuracy: number;
 }
 
-// ENGLISH_STOP_WORDS and CHINESE_STOP_CHARS imported from constants.ts
+// ENGLISH_STOP_WORDS, CHINESE_STOP_CHARS, CHINESE_STOP_WORDS, CHINESE_PHRASE_BLACKLIST imported from constants.ts
+
+/**
+ * Check if a Chinese phrase contains stop characters or is a blacklisted phrase.
+ */
+function isInvalidChinesePhrase(phrase: string): boolean {
+  // Check if it's a blacklisted phrase
+  if (CHINESE_PHRASE_BLACKLIST.has(phrase)) return true;
+  
+  // Check if any character is a stop character
+  for (const char of phrase) {
+    if (CHINESE_STOP_CHARS.has(char)) return true;
+  }
+  
+  // Check if it's a stop word
+  if (CHINESE_STOP_WORDS.has(phrase)) return true;
+  
+  return false;
+}
 
 /**
  * Extract significant words/phrases from a message.
  * Returns bigrams and meaningful single words.
+ * Improved version with better Chinese phrase filtering.
  */
 export function extractSignificantTokens(text: string): string[] {
   const lower = text.toLowerCase().trim();
@@ -45,20 +64,33 @@ export function extractSignificantTokens(text: string): string[] {
         // Extract individual CJK chars and check stop list
         const chars = [...seg.replace(/[^\u4e00-\u9fff]/g, "")];
 
-        // Unigrams (length >= 2 sequences handled as words below)
-        // Chinese "words" — runs of 2–6 CJK chars not starting with stop char
+        // Chinese "words" — runs of 2–6 CJK chars not starting/ending with stop char
         const wordPattern = /[\u4e00-\u9fff]{2,6}/g;
         let match: RegExpExecArray | null;
         while ((match = wordPattern.exec(seg)) !== null) {
-          if (!CHINESE_STOP_CHARS.has(match[0][0])) {
-            tokens.push(match[0]);
+          const word = match[0];
+          if (!isInvalidChinesePhrase(word) &&
+              !CHINESE_STOP_CHARS.has(word[word.length - 1])) {
+            tokens.push(word);
           }
         }
 
-        // Bigrams from CJK chars
+        // Bigrams from CJK chars (with improved filtering)
         for (let i = 0; i < chars.length - 1; i++) {
-          if (!CHINESE_STOP_CHARS.has(chars[i]) && !CHINESE_STOP_CHARS.has(chars[i + 1])) {
-            tokens.push(chars[i] + chars[i + 1]);
+          const bigram = chars[i] + chars[i + 1];
+          if (!isInvalidChinesePhrase(bigram)) {
+            tokens.push(bigram);
+          }
+        }
+        
+        // Trigrams from CJK chars (only meaningful ones)
+        for (let i = 0; i < chars.length - 2; i++) {
+          const trigram = chars[i] + chars[i + 1] + chars[i + 2];
+          // For trigrams, check if not blacklisted and doesn't start/end with stop char
+          if (!CHINESE_PHRASE_BLACKLIST.has(trigram) &&
+              !CHINESE_STOP_CHARS.has(trigram[0]) &&
+              !CHINESE_STOP_CHARS.has(trigram[2])) {
+            tokens.push(trigram);
           }
         }
       } else {

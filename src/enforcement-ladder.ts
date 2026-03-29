@@ -1,6 +1,7 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { ObservationStats } from "./observation-engine.js";
+import { loggers } from "./errors.ts";
 
 export type EnforcementLevel = 0 | 1 | 2 | 3;
 
@@ -87,7 +88,8 @@ export function loadEnforcementState(sharedRoot: string): EnforcementState {
       return createDefaultState();
     }
     return parsed;
-  } catch {
+  } catch (error) {
+    loggers.enforcement.error(`Failed to load enforcement state`, error, { path: filePath });
     return createDefaultState();
   }
 }

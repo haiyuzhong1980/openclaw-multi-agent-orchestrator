@@ -1,6 +1,6 @@
 import { existsSync } from "node:fs";
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
-import { extractIntentPhrases, recordClassification, recordCorrection, detectCorrection } from "../intent-registry.ts";
+import { extractIntentPhrases, recordClassification, recordCorrection, recordConfirmation, detectCorrection } from "../intent-registry.ts";
 import { inferExecutionComplexity } from "../execution-policy.ts";
 import {
   createObservation,
@@ -62,6 +62,12 @@ export function createMessageHandler(
         userFollowUp: feedback.type,
         actualTier: feedback.actualTier,
       });
+      
+      // Learn from confirmation: reinforce the correct classification
+      if (feedback.type === "satisfied" && state.lastClassification) {
+        recordConfirmation(state.intentRegistry, state.lastClassification.phrases, state.lastClassification.tier);
+        api.logger.info(`[OMA] Intent confirmation learned: ${state.lastClassification.tier}`);
+      }
     }
 
     // Record the current classification

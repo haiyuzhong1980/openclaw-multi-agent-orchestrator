@@ -1,5 +1,6 @@
 import { join } from "node:path";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
 import type { AnyAgentTool, OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { createMultiAgentOrchestratorTool, MultiAgentOrchestratorSchema } from "./src/tool.ts";
 import { loadAgentRegistry, searchAgents, getAgentsByCategory } from "./src/agent-registry.ts";
@@ -26,8 +27,17 @@ import {
   getPendingMessages,
   markMessageProcessed,
   formatMessages,
-  MessageType,
+  getMessageHistory,
+  formatMessageHistory,
 } from "./src/message-manager.ts";
+import { MessageType } from "./src/types.ts";
+// M8: TOML templates
+import {
+  parseTomlTemplate,
+  loadTomlTemplates,
+  validateTomlTemplate,
+  formatTomlTemplate,
+} from "./src/toml-parser.ts";
 import { addUserKeyword, saveUserKeywords } from "./src/user-keywords.ts";
 import {
   saveIntentRegistry,
@@ -280,6 +290,158 @@ export default function register(api: OpenClawPluginApi) {
     },
   });
 
+  // M8: TOML template commands
+  api.registerCommand({
+    name: "mao-toml-templates",
+    description: "List TOML templates from ~/.openclaw/templates/",
+    handler: () => {
+      const templatesDir = join(state.sharedRoot, "..", "templates");
+      const templates = loadTomlTemplates(templatesDir);
+
+      if (templates.length === 0) {
+        return {
+          text: [
+            "No TOML templates found.",
+            `Expected directory: ${templatesDir}`,
+            "",
+            "Create a template file like this:",
+            "  ~/.openclaw/templates/my-template.toml",
+          ].join("\n"),
+        };
+      }
+
+      const lines = templates.map((t) => `**${t.id}** — ${t.name}`);
+      return { text: `Found ${templates.length} TOML template(s):\n\n` + lines.join("\n") };
+    },
+  });
+
+  api.registerCommand({
+    name: "mao-toml-template",
+    description: "Show details for a TOML template",
+    acceptsArgs: true,
+    handler: (ctx) => {
+      const id = (ctx.args ?? "").trim();
+      if (!id) return { text: "Usage: /mao-toml-template <template-id>" };
+
+      const templatesDir = join(state.sharedRoot, "..", "templates");
+      const templates = loadTomlTemplates(templatesDir);
+      const template = templates.find((t) => t.id === id);
+
+      if (!template) {
+        return { text: `TOML template "${id}" not found.` };
+      }
+
+      const errors = validateTomlTemplate(template);
+      const errorText = errors.length > 0 ? `\n\n⚠️ **Validation errors:**\n${errors.map((e) => `- ${e}`).join("\n")}` : "";
+
+      return { text: formatTomlTemplate(template) + errorText };
+    },
+  });
+
+  api.registerCommand({
+    name: "mao-toml-validate",
+    description: "Validate a TOML template file",
+    acceptsArgs: true,
+    handler: (ctx) => {
+      const filePath = (ctx.args ?? "").trim();
+      if (!filePath) return { text: "Usage: /mao-toml-validate <path-to-toml-file>" };
+
+      const content = existsSync(filePath) ? readFileSync(filePath, "utf-8") : null;
+      if (!content) {
+        return { text: `File not found: ${filePath}` };
+      }
+
+      const template = parseTomlTemplate(content);
+      if (!template) {
+        return { text: `Failed to parse TOML template from ${filePath}` };
+      }
+
+      const errors = validateTomlTemplate(template);
+
+      if (errors.length === 0) {
+        return { text: `✅ Template "${template.id}" is valid!\n\n${formatTomlTemplate(template)}` };
+      }
+
+      return {
+        text: [
+          `❌ Template "${template.id}" has ${errors.length} error(s):`,
+          "",
+          ...errors.map((e) => `- ${e}`),
+        ].join("\n"),
+      };
+    },
+  });
+
+  // M8-06: Interactive TOML template creator
+  api.registerCommand({
+    name: "mao-template-create",
+    description: "Create a new TOML template interactively. Usage: /mao-template-create <template-id>",
+    acceptsArgs: true,
+    handler: (ctx) => {
+      const templateId = (ctx.args ?? "").trim();
+      if (!templateId) {
+        return {
+          text: [
+            "Usage: /mao-template-create <template-id>",
+            "",
+            "This command creates a basic TOML template file in ~/.openclaw/templates/",
+            "You can then edit it to customize agents and tasks.",
+          ].join("\n"),
+        };
+      }
+
+      const templatesDir = join(homedir(), ".openclaw", "templates");
+      if (!existsSync(templatesDir)) {
+        mkdirSync(templatesDir, { recursive: true });
+      }
+
+      const filePath = join(templatesDir, `${templateId}.toml`);
+      if (existsSync(filePath)) {
+        return { text: `Template "${templateId}" already exists at ${filePath}` };
+      }
+
+      // Create a basic template structure
+      const content = `# ${templateId} Template
+# Created by /mao-template-create on ${new Date().toISOString().split("T")[0]}
+
+[template]
+id = "${templateId}"
+name = "${templateId.charAt(0).toUpperCase() + templateId.slice(1).replace(/-/g, " ")}"
+description = "Description of what this template does"
+
+[template.leader]
+name = "lead-agent"
+type = "planner"
+task = """
+Main task description for the leader agent.
+"""
+
+[[template.agents]]
+name = "worker-1"
+type = "executor"
+task = "Task description for worker-1."
+
+[[template.tasks]]
+subject = "Main task"
+owner = "lead-agent"
+`;
+
+      writeFileSync(filePath, content, "utf-8");
+      return {
+        text: [
+          `✅ Created template "${templateId}" at ${filePath}`,
+          "",
+          "Edit the file to customize:",
+          "- Add more agents in [[template.agents]] sections",
+          "- Define tasks in [[template.tasks]] sections",
+          "- Use blockedBy for task dependencies",
+          "",
+          "Validate with: /mao-toml-validate ${filePath}",
+        ].join("\n"),
+      };
+    },
+  });
+
   api.registerCommand({
     name: "mao-audit",
     description: "Show recent orchestration audit log",
@@ -517,6 +679,34 @@ export default function register(api: OpenClawPluginApi) {
       );
 
       return { text: success ? `✅ Message ${messageId} marked as processed` : `❌ Message ${messageId} not found` };
+    },
+  });
+
+  // M7-09: View message history (processed messages)
+  api.registerCommand({
+    name: "mao-inbox-history",
+    description: "View processed message history. Usage: /mao-inbox-history [limit]",
+    acceptsArgs: true,
+    handler: (ctx) => {
+      if (!state.agentIdentity) {
+        return { text: "No agent identity set. This command is only available to spawned agents." };
+      }
+
+      const limitArg = (ctx.args ?? "").trim();
+      const limit = limitArg ? parseInt(limitArg, 10) : 20;
+
+      if (isNaN(limit) || limit < 1 || limit > 100) {
+        return { text: "Limit must be a number between 1 and 100." };
+      }
+
+      const messages = getMessageHistory(
+        state.sharedRoot,
+        state.agentIdentity.teamName,
+        state.agentIdentity.agentId,
+        limit,
+      );
+
+      return { text: formatMessageHistory(messages) };
     },
   });
 

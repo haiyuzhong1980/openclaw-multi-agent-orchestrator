@@ -85,7 +85,8 @@ export function createPromptBuilder(
         try {
           const registry = loadAgentRegistry(config.agentRegistryPath);
           return registry.agents.map((a) => `${a.name} (${a.category}): ${a.description?.slice(0, 60) ?? ""}`);
-        } catch {
+        } catch (error) {
+          console.error(`[prompt-builder] Failed to load agent registry:`, error);
           return undefined;
         }
       })();

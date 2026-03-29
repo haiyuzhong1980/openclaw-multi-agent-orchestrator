@@ -11,7 +11,7 @@ import { recordPlan, recordEnforcement, recordTrackResult, getMissingTracks, get
 import type { AuditLog } from "./audit-log.ts";
 import { logEvent } from "./audit-log.ts";
 import type { TaskBoard } from "./task-board.ts";
-import { loadBoard, saveBoard, createProject, addTask, addTaskDependency, findTaskByLabel } from "./task-board.ts";
+import { loadBoard, loadBoardWithRecovery, saveBoardWithVersionCheck, createProject, addTask, addTaskDependency, findTaskByLabel } from "./task-board.ts";
 import { buildDispatchGuidance } from "./prompt-guidance.ts";
 import { runEvolutionCycle, appendEvolutionReport, formatEvolutionReport } from "./evolution-cycle.ts";
 import type { EvolutionReport } from "./evolution-cycle.ts";
@@ -173,7 +173,18 @@ export function createMultiAgentOrchestratorTool(params?: {
           typeof rawParams.ofmsSharedRoot === "string"
             ? rawParams.ofmsSharedRoot
             : (params?.sharedRoot ?? "");
-        const board: TaskBoard = params?.board ?? (sharedRoot ? loadBoard(sharedRoot) : { projects: [], version: 1 });
+        let board: TaskBoard;
+        if (params?.board) {
+          board = params.board;
+        } else if (sharedRoot) {
+          const result = loadBoardWithRecovery(sharedRoot);
+          board = result.board;
+          if (result.error) {
+            log?.(`[tool] action=orchestrate board load warning: ${result.error}`);
+          }
+        } else {
+          board = { projects: [], version: 1 };
+        }
 
         // Plan tracks using existing logic
         const agentType = typeof rawParams.agentType === "string" ? rawParams.agentType : undefined;
@@ -225,15 +236,75 @@ export function createMultiAgentOrchestratorTool(params?: {
         // M5-12: Apply task dependencies if provided
         // Format: { "Task A label": ["Task B label", "Task C label"] } means A blocks B and C
         const rawTaskDeps = rawParams.taskDependencies as Record<string, string[]> | undefined;
+        const dependencyErrors: Array<{ blockingLabel: string; blockedLabel: string; error: string }> = [];
+        
         if (rawTaskDeps) {
           for (const [blockingLabel, blockedLabels] of Object.entries(rawTaskDeps)) {
             const blockingTask = findTaskByLabel(project, blockingLabel);
-            if (blockingTask && Array.isArray(blockedLabels)) {
-              for (const blockedLabel of blockedLabels) {
-                const blockedTask = findTaskByLabel(project, blockedLabel);
-                if (blockedTask) {
-                  addTaskDependency(board, blockingTask.id, blockedTask.id);
+            if (!blockingTask) {
+              log?.(`[tool] action=orchestrate dependency warning: blocking task "${blockingLabel}" not found`);
+              continue;
+            }
+            
+            if (!Array.isArray(blockedLabels)) {
+              log?.(`[tool] action=orchestrate dependency warning: blockedLabels for "${blockingLabel}" is not an array`);
+              continue;
+            }
+            
+            for (const blockedLabel of blockedLabels) {
+              const blockedTask = findTaskByLabel(project, blockedLabel);
+              if (!blockedTask) {
+                log?.(`[tool] action=orchestrate dependency warning: blocked task "${blockedLabel}" not found`);
+                continue;
+              }
+              
+              // Add dependency with retry logic for transient failures
+              let lastError: string | undefined;
+              let retries = 0;
+              const maxRetries = 3;
+              
+              while (retries < maxRetries) {
+                const result = addTaskDependency(board, blockingTask.id, blockedTask.id);
+                
+                if (result.success) {
+                  break; // Success, exit retry loop
                 }
+                
+                lastError = result.error;
+                
+                // "Dependency already exists" is idempotent - treat as success
+                if (result.error === "Dependency already exists") {
+                  log?.(`[tool] action=orchestrate dependency skipped: "${blockingLabel}" -> "${blockedLabel}" already exists`);
+                  break;
+                }
+                
+                // For "Task not found" or cycle errors, retry won't help
+                if (result.error === "Task not found" || result.error?.startsWith("Would create cycle")) {
+                  dependencyErrors.push({
+                    blockingLabel,
+                    blockedLabel,
+                    error: result.error,
+                  });
+                  log?.(`[tool] action=orchestrate dependency failed: "${blockingLabel}" -> "${blockedLabel}": ${result.error}`);
+                  break;
+                }
+                
+                // For other errors, retry with exponential backoff
+                retries++;
+                if (retries < maxRetries) {
+                  log?.(`[tool] action=orchestrate dependency retry ${retries}/${maxRetries}: "${blockingLabel}" -> "${blockedLabel}"`);
+                  // Note: In-memory operations don't need actual delay, but keeping pattern for future persistence
+                }
+              }
+              
+              // Log final failure after all retries
+              if (retries >= maxRetries && lastError) {
+                dependencyErrors.push({
+                  blockingLabel,
+                  blockedLabel,
+                  error: lastError ?? "Unknown error after retries",
+                });
+                log?.(`[tool] action=orchestrate dependency failed after ${maxRetries} retries: "${blockingLabel}" -> "${blockedLabel}": ${lastError}`);
               }
             }
           }
@@ -241,7 +312,40 @@ export function createMultiAgentOrchestratorTool(params?: {
 
         // Persist if we have a shared root
         if (sharedRoot) {
-          saveBoard(sharedRoot, board);
+          const saveResult = saveBoardWithVersionCheck(sharedRoot, board, board.version);
+          if (!saveResult.success && saveResult.conflict) {
+            log?.(`[tool] action=orchestrate conflict detected: expected v${saveResult.expectedVersion}, current v${saveResult.currentVersion}`);
+            // Reload and retry once
+            const reloadResult = loadBoardWithRecovery(sharedRoot);
+            const reloadedBoard = reloadResult.board;
+            if (reloadResult.error) {
+              log?.(`[tool] action=orchestrate reload warning: ${reloadResult.error}`);
+            }
+            const reloadedProject = reloadedBoard.projects.find((p) => p.id === project.id);
+            if (reloadedProject) {
+              // Merge our tasks into the reloaded board
+              for (const task of project.tasks) {
+                if (!reloadedProject.tasks.some((t) => t.id === task.id)) {
+                  reloadedProject.tasks.push(task);
+                }
+              }
+              const retryResult = saveBoardWithVersionCheck(sharedRoot, reloadedBoard, reloadedBoard.version);
+              if (!retryResult.success) {
+                // Still failing - return error to caller
+                return {
+                  content: [{
+                    type: "text",
+                    text: `Failed to save board after conflict: version mismatch. Please retry the operation.`,
+                  }],
+                  details: {
+                    conflict: true,
+                    currentVersion: retryResult.currentVersion,
+                    expectedVersion: retryResult.expectedVersion,
+                  },
+                };
+              }
+            }
+          }
         }
 
         const guidance = buildDispatchGuidance(project);
@@ -254,11 +358,22 @@ export function createMultiAgentOrchestratorTool(params?: {
           });
         }
 
+        // Include dependency errors in response if any
+        let responseText = guidance;
+        if (dependencyErrors.length > 0) {
+          const errorSummary = dependencyErrors
+            .map((e) => `- "${e.blockingLabel}" -> "${e.blockedLabel}": ${e.error}`)
+            .join("\n");
+          responseText += `\n\n⚠️ Task dependency errors:\n${errorSummary}`;
+          log?.(`[tool] action=orchestrate completed with ${dependencyErrors.length} dependency errors`);
+        }
+
         return {
-          content: [{ type: "text", text: guidance }],
+          content: [{ type: "text", text: responseText }],
           details: {
             projectId: project.id,
             tasks: project.tasks.map((t) => ({ id: t.id, label: t.label, trackId: t.trackId })),
+            dependencyErrors: dependencyErrors.length > 0 ? dependencyErrors : undefined,
           },
         };
       }

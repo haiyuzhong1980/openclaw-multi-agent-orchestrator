@@ -1,5 +1,6 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { loggers } from "./errors.ts";
 
 export interface UserKeywords {
   delegation: string[];
@@ -20,7 +21,8 @@ export function loadUserKeywords(sharedRoot: string): UserKeywords {
   }
   try {
     return JSON.parse(readFileSync(filePath, "utf-8")) as UserKeywords;
-  } catch {
+  } catch (error) {
+    loggers.userKeywords.error(`Failed to load user keywords`, error, { path: filePath });
     return { delegation: [], tracked: [], light: [], updatedAt: "" };
   }
 }

@@ -4,6 +4,7 @@ import type { EnforcementState } from "./enforcement-ladder.ts";
 import type { ObservationRecord } from "./observation-engine.ts";
 import { computeStats } from "./observation-engine.ts";
 import { addUserKeyword } from "./user-keywords.ts";
+import { loggers } from "./errors.ts";
 
 export interface ExportedPatterns {
   version: number;
@@ -134,7 +135,8 @@ export function parseImport(json: string): ExportedPatterns | null {
       return null;
     }
     return parsed;
-  } catch {
+  } catch (error) {
+    loggers.patternExport.error(`Failed to import patterns`, error);
     return null;
   }
 }

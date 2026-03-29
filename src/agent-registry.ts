@@ -1,6 +1,7 @@
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join, basename } from "node:path";
 import type { PlannedTrack } from "./types.ts";
+import { loggers } from "./errors.ts";
 
 export interface AgentDefinition {
   name: string;
@@ -111,7 +112,8 @@ export function parseAgentFile(filePath: string, category: string): AgentDefinit
       criticalRules: criticalRules.slice(0, 500),
       tools,
     };
-  } catch {
+  } catch (error) {
+    loggers.agentRegistry.error(`Failed to parse agent definition`, error, { file: filePath });
     return null;
   }
 }

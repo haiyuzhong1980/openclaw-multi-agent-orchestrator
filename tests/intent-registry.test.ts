@@ -5,11 +5,20 @@ import {
   extractIntentPhrases,
   recordClassification,
   recordCorrection,
+  recordConfirmation,
   checkLearnedPatterns,
+  checkLearnedPatternsWithDetails,
   detectCorrection,
   decayPatterns,
+  DEFAULT_CONFLICT_CONFIG,
+  recordPredictionResult,
+  getDynamicThreshold,
+  adjustDynamicThreshold,
+  getDynamicConflictConfig,
+  DEFAULT_DYNAMIC_THRESHOLD_CONFIG,
 } from "../src/intent-registry.ts";
-import type { IntentRegistry } from "../src/intent-registry.ts";
+import type { IntentRegistry, ConflictResolutionConfig } from "../src/intent-registry.ts";
+import { CHINESE_STOP_CHARS } from "../src/constants.ts";
 
 describe("extractIntentPhrases", () => {
   it("extracts meaningful phrases from Chinese text", () => {
@@ -181,6 +190,88 @@ describe("recordCorrection", () => {
   });
 });
 
+describe("recordConfirmation", () => {
+  let registry: IntentRegistry;
+
+  beforeEach(() => {
+    registry = createEmptyRegistry();
+    // Seed a pattern: "deploy" classified as delegation 3 times
+    recordClassification(registry, ["deploy"], "delegation");
+    recordClassification(registry, ["deploy"], "delegation");
+    recordClassification(registry, ["deploy"], "delegation");
+  });
+
+  it("increments totalConfirmations", () => {
+    recordConfirmation(registry, ["deploy"], "delegation");
+    assert.equal(registry.totalConfirmations, 1);
+  });
+
+  it("increases confidence of confirmed tier", () => {
+    const before = registry.patterns["deploy"].confidence.delegation;
+    recordConfirmation(registry, ["deploy"], "delegation");
+    const after = registry.patterns["deploy"].confidence.delegation;
+    assert.ok(after >= before, `Expected confidence to increase or stay same, was ${before} now ${after}`);
+  });
+
+  it("increases tier count for confirmed tier", () => {
+    const before = registry.patterns["deploy"].delegationCount;
+    recordConfirmation(registry, ["deploy"], "delegation");
+    assert.equal(registry.patterns["deploy"].delegationCount, before + 1);
+  });
+
+  it("increases occurrences count", () => {
+    const before = registry.patterns["deploy"].occurrences;
+    recordConfirmation(registry, ["deploy"], "delegation");
+    assert.equal(registry.patterns["deploy"].occurrences, before + 1);
+  });
+
+  it("updates lastSeen timestamp", () => {
+    const before = registry.patterns["deploy"].lastSeen;
+    // Wait a tiny bit to ensure timestamp difference
+    registry.patterns["deploy"].lastSeen = new Date(Date.now() - 1000).toISOString();
+    recordConfirmation(registry, ["deploy"], "delegation");
+    const after = new Date(registry.patterns["deploy"].lastSeen).getTime();
+    const beforeTime = new Date(before).getTime();
+    assert.ok(after >= beforeTime, "Expected lastSeen to be updated");
+  });
+
+  it("supports custom boost value", () => {
+    const before = registry.patterns["deploy"].delegationCount;
+    recordConfirmation(registry, ["deploy"], "delegation", { confirmationBoost: 3 });
+    assert.equal(registry.patterns["deploy"].delegationCount, before + 3);
+  });
+
+  it("can be disabled via config", () => {
+    const before = registry.patterns["deploy"].delegationCount;
+    recordConfirmation(registry, ["deploy"], "delegation", { enableConfirmationLearning: false });
+    assert.equal(registry.patterns["deploy"].delegationCount, before);
+    // Should NOT increment totalConfirmations when disabled (early return)
+    assert.equal(registry.totalConfirmations, 0);
+  });
+
+  it("skips phrases that don't exist in registry", () => {
+    // Should not throw for unknown phrase
+    assert.doesNotThrow(() => {
+      recordConfirmation(registry, ["nonexistent"], "delegation");
+    });
+    assert.equal(registry.totalConfirmations, 1);
+  });
+
+  it("works for tracked tier", () => {
+    recordClassification(registry, ["audit"], "tracked");
+    const before = registry.patterns["audit"].trackedCount;
+    recordConfirmation(registry, ["audit"], "tracked");
+    assert.equal(registry.patterns["audit"].trackedCount, before + 1);
+  });
+
+  it("works for light tier", () => {
+    recordClassification(registry, ["hello"], "light");
+    const before = registry.patterns["hello"].lightCount;
+    recordConfirmation(registry, ["hello"], "light");
+    assert.equal(registry.patterns["hello"].lightCount, before + 1);
+  });
+});
+
 describe("checkLearnedPatterns", () => {
   let registry: IntentRegistry;
 
@@ -345,5 +436,347 @@ describe("decayPatterns", () => {
     const registry = createEmptyRegistry();
     const decayed = decayPatterns(registry);
     assert.equal(decayed, 0);
+  });
+});
+
+describe("Conflict Resolution", () => {
+  let registry: IntentRegistry;
+
+  beforeEach(() => {
+    registry = createEmptyRegistry();
+  });
+
+  describe("checkLearnedPatternsWithDetails", () => {
+    it("returns detailed result with matched patterns", () => {
+      // Train "deploy" as delegation 3 times
+      recordClassification(registry, ["deploy"], "delegation");
+      recordClassification(registry, ["deploy"], "delegation");
+      recordClassification(registry, ["deploy"], "delegation");
+
+      const result = checkLearnedPatternsWithDetails("deploy system", registry);
+
+      assert.equal(result.tier, "delegation");
+      assert.ok(result.matchedPatterns.length > 0, "Should have matched patterns");
+      assert.equal(result.resolution.hasConflict, false);
+      assert.ok(result.resolution.reason.includes("Single match"), `Got: ${result.resolution.reason}`);
+    });
+
+    it("collects all matching patterns", () => {
+      // Train multiple patterns
+      for (let i = 0; i < 3; i++) {
+        recordClassification(registry, ["deploy"], "delegation");
+        recordClassification(registry, ["audit"], "tracked");
+      }
+
+      const result = checkLearnedPatternsWithDetails("deploy and audit the system", registry);
+
+      assert.ok(result.matchedPatterns.length >= 2, `Expected at least 2 matches, got ${result.matchedPatterns.length}`);
+      // Both patterns agree on different tiers, so there's a conflict
+      assert.equal(result.resolution.hasConflict, true);
+    });
+
+    it("resolves conflict using weighted strategy by default", () => {
+      // Train patterns with different occurrences
+      for (let i = 0; i < 5; i++) {
+        recordClassification(registry, ["deploy"], "delegation");
+      }
+      for (let i = 0; i < 3; i++) {
+        recordClassification(registry, ["audit"], "tracked");
+      }
+
+      const result = checkLearnedPatternsWithDetails("deploy and audit the system", registry);
+
+      assert.equal(result.resolution.strategy, "weighted");
+      // "deploy" should win because it has more occurrences
+      assert.equal(result.tier, "delegation");
+    });
+
+    it("supports voting strategy", () => {
+      // Create patterns with different occurrence counts
+      for (let i = 0; i < 3; i++) {
+        recordClassification(registry, ["deploy"], "delegation");
+      }
+      for (let i = 0; i < 5; i++) {
+        recordClassification(registry, ["audit"], "tracked");
+      }
+
+      const config: Partial<ConflictResolutionConfig> = { strategy: "voting" };
+      const result = checkLearnedPatternsWithDetails("deploy and audit the system", registry, config);
+
+      assert.equal(result.resolution.strategy, "voting");
+      // "audit" should win because it has more occurrences (votes)
+      assert.equal(result.tier, "tracked");
+    });
+
+    it("supports highest_confidence strategy", () => {
+      // Create patterns with different confidence levels
+      // "deploy" with higher confidence (4/4 = 1.0)
+      for (let i = 0; i < 4; i++) {
+        recordClassification(registry, ["deploy"], "delegation");
+      }
+      // "audit" with lower confidence (3/5 = 0.6)
+      recordClassification(registry, ["audit"], "tracked");
+      recordClassification(registry, ["audit"], "tracked");
+      recordClassification(registry, ["audit"], "tracked");
+      recordClassification(registry, ["audit"], "delegation"); // mixed
+      recordClassification(registry, ["audit"], "delegation");
+
+      const config: Partial<ConflictResolutionConfig> = { strategy: "highest_confidence" };
+      const result = checkLearnedPatternsWithDetails("deploy and audit the system", registry, config);
+
+      assert.equal(result.resolution.strategy, "highest_confidence");
+      // "deploy" has higher confidence (1.0 vs 0.6)
+      assert.equal(result.tier, "delegation");
+    });
+
+    it("supports first strategy (legacy behavior)", () => {
+      // Train multiple patterns
+      for (let i = 0; i < 3; i++) {
+        recordClassification(registry, ["deploy"], "delegation");
+        recordClassification(registry, ["audit"], "tracked");
+      }
+
+      const config: Partial<ConflictResolutionConfig> = { strategy: "first" };
+      const result = checkLearnedPatternsWithDetails("deploy and audit the system", registry, config);
+
+      assert.equal(result.resolution.strategy, "first");
+      assert.ok(result.tier !== null, "Should return a tier");
+    });
+
+    it("returns no conflict when all patterns agree", () => {
+      // Train multiple patterns all pointing to delegation
+      for (let i = 0; i < 3; i++) {
+        recordClassification(registry, ["deploy"], "delegation");
+        recordClassification(registry, ["release"], "delegation");
+        recordClassification(registry, ["ship"], "delegation");
+      }
+
+      const result = checkLearnedPatternsWithDetails("deploy and release and ship", registry);
+
+      // All patterns agree on delegation, so no conflict
+      assert.equal(result.resolution.hasConflict, false);
+      assert.equal(result.tier, "delegation");
+      assert.ok(result.resolution.reason.includes("agree"), `Got: ${result.resolution.reason}`);
+    });
+
+    it("respects custom minOccurrences config", () => {
+      // Train with only 2 occurrences
+      recordClassification(registry, ["deploy"], "delegation");
+      recordClassification(registry, ["deploy"], "delegation");
+
+      // Default minOccurrences is 3, so should return null
+      const result1 = checkLearnedPatternsWithDetails("deploy system", registry);
+      assert.equal(result1.tier, null);
+
+      // With minOccurrences = 2, should match
+      const config: Partial<ConflictResolutionConfig> = { minOccurrences: 2 };
+      const result2 = checkLearnedPatternsWithDetails("deploy system", registry, config);
+      assert.equal(result2.tier, "delegation");
+    });
+
+    it("respects custom confidenceThreshold config", () => {
+      // Train with mixed signals (confidence will be ~0.67)
+      recordClassification(registry, ["test"], "delegation");
+      recordClassification(registry, ["test"], "delegation");
+      recordClassification(registry, ["test"], "tracked"); // mixed
+
+      // Default threshold is 0.7, so should return null
+      const result1 = checkLearnedPatternsWithDetails("test system", registry);
+      assert.equal(result1.tier, null);
+
+      // With lower threshold, should match
+      const config: Partial<ConflictResolutionConfig> = { confidenceThreshold: 0.6 };
+      const result2 = checkLearnedPatternsWithDetails("test system", registry, config);
+      assert.equal(result2.tier, "delegation");
+    });
+  });
+
+  describe("DEFAULT_CONFLICT_CONFIG", () => {
+    it("has expected default values", () => {
+      assert.equal(DEFAULT_CONFLICT_CONFIG.strategy, "weighted");
+      assert.equal(DEFAULT_CONFLICT_CONFIG.minOccurrences, 3);
+      assert.equal(DEFAULT_CONFLICT_CONFIG.confidenceThreshold, 0.7);
+      assert.ok(DEFAULT_CONFLICT_CONFIG.weightDecayFactor > 0 && DEFAULT_CONFLICT_CONFIG.weightDecayFactor <= 1);
+    });
+  });
+});
+
+// ============================================================================
+// Dynamic Threshold Tests
+// ============================================================================
+
+describe("Dynamic Threshold Adjustment", () => {
+  let registry: IntentRegistry;
+
+  beforeEach(() => {
+    registry = createEmptyRegistry();
+  });
+
+  describe("createEmptyRegistry", () => {
+    it("initializes thresholdState with default values", () => {
+      assert.ok(registry.thresholdState, "Should have thresholdState");
+      assert.equal(registry.thresholdState!.currentThreshold, 0.7, "Should have base threshold 0.7");
+      assert.equal(registry.thresholdState!.totalCorrect, 0);
+      assert.equal(registry.thresholdState!.totalPredictions, 0);
+    });
+  });
+
+  describe("recordPredictionResult", () => {
+    it("records correct predictions", () => {
+      recordPredictionResult(registry, true);
+      assert.equal(registry.thresholdState!.totalPredictions, 1);
+      assert.equal(registry.thresholdState!.totalCorrect, 1);
+    });
+
+    it("records incorrect predictions", () => {
+      recordPredictionResult(registry, false);
+      assert.equal(registry.thresholdState!.totalPredictions, 1);
+      assert.equal(registry.thresholdState!.totalCorrect, 0);
+    });
+
+    it("initializes thresholdState if missing", () => {
+      const registryNoState: IntentRegistry = {
+        patterns: {},
+        totalClassifications: 0,
+        totalCorrections: 0,
+        totalConfirmations: 0,
+        lastUpdated: new Date().toISOString(),
+        version: 1,
+      };
+      recordPredictionResult(registryNoState, true);
+      assert.ok(registryNoState.thresholdState, "Should create thresholdState");
+    });
+  });
+
+  describe("getDynamicThreshold", () => {
+    it("returns base threshold when disabled", () => {
+      const config = { ...DEFAULT_DYNAMIC_THRESHOLD_CONFIG, enabled: false };
+      const threshold = getDynamicThreshold(registry, config);
+      assert.equal(threshold, 0.7, "Should return base threshold when disabled");
+    });
+
+    it("returns current threshold from registry", () => {
+      registry.thresholdState!.currentThreshold = 0.6;
+      const threshold = getDynamicThreshold(registry);
+      assert.equal(threshold, 0.6, "Should return registry's current threshold");
+    });
+  });
+
+  describe("adjustDynamicThreshold", () => {
+    it("returns null when not enough samples", () => {
+      registry.thresholdState!.totalPredictions = 10;
+      registry.thresholdState!.totalCorrect = 8;
+      const result = adjustDynamicThreshold(registry);
+      assert.equal(result, null, "Should return null with < 20 samples");
+    });
+
+    it("lowers threshold when accuracy is high", () => {
+      registry.thresholdState!.totalPredictions = 30;
+      registry.thresholdState!.totalCorrect = 28; // 93% accuracy
+      registry.thresholdState!.currentThreshold = 0.7;
+      
+      const result = adjustDynamicThreshold(registry);
+      assert.ok(result, "Should return adjustment result");
+      assert.ok(result!.newThreshold < 0.7, "Should lower threshold");
+      assert.ok(result!.reason.includes("lowering"), "Reason should mention lowering");
+    });
+
+    it("raises threshold when accuracy is low", () => {
+      registry.thresholdState!.totalPredictions = 30;
+      registry.thresholdState!.totalCorrect = 15; // 50% accuracy
+      registry.thresholdState!.currentThreshold = 0.7;
+      
+      const result = adjustDynamicThreshold(registry);
+      assert.ok(result, "Should return adjustment result");
+      assert.ok(result!.newThreshold > 0.7, "Should raise threshold");
+      assert.ok(result!.reason.includes("raising"), "Reason should mention raising");
+    });
+
+    it("respects minThreshold limit", () => {
+      registry.thresholdState!.totalPredictions = 30;
+      registry.thresholdState!.totalCorrect = 30; // 100% accuracy
+      registry.thresholdState!.currentThreshold = 0.52;
+      
+      const result = adjustDynamicThreshold(registry);
+      assert.ok(result!.newThreshold >= DEFAULT_DYNAMIC_THRESHOLD_CONFIG.minThreshold, 
+        "Should not go below minThreshold");
+    });
+
+    it("respects maxThreshold limit", () => {
+      registry.thresholdState!.totalPredictions = 30;
+      registry.thresholdState!.totalCorrect = 5; // Very low accuracy
+      registry.thresholdState!.currentThreshold = 0.88;
+      
+      const result = adjustDynamicThreshold(registry);
+      assert.ok(result!.newThreshold <= DEFAULT_DYNAMIC_THRESHOLD_CONFIG.maxThreshold, 
+        "Should not exceed maxThreshold");
+    });
+
+    it("records adjustment in history", () => {
+      registry.thresholdState!.totalPredictions = 30;
+      registry.thresholdState!.totalCorrect = 28;
+      
+      adjustDynamicThreshold(registry);
+      assert.ok(registry.thresholdState!.accuracyHistory.length > 0, 
+        "Should record in history");
+    });
+  });
+
+  describe("getDynamicConflictConfig", () => {
+    it("returns config with dynamic threshold", () => {
+      registry.thresholdState!.currentThreshold = 0.65;
+      
+      const config = getDynamicConflictConfig(registry);
+      assert.equal(config.confidenceThreshold, 0.65, "Should use dynamic threshold");
+    });
+
+    it("merges with base config", () => {
+      registry.thresholdState!.currentThreshold = 0.6;
+      
+      const config = getDynamicConflictConfig(registry, { minOccurrences: 5 });
+      assert.equal(config.minOccurrences, 5, "Should preserve other config values");
+      assert.equal(config.confidenceThreshold, 0.6, "Should use dynamic threshold");
+    });
+  });
+});
+
+// ============================================================================
+// Improved Chinese Phrase Extraction Tests
+// ============================================================================
+
+describe("Improved Chinese Phrase Extraction", () => {
+  it("filters out blacklisted bigrams", () => {
+    const phrases = extractIntentPhrases("这是一个测试");
+    // "这是" and "一个" are blacklisted
+    assert.ok(!phrases.includes("这是"), "Should filter out blacklisted bigram '这是'");
+    assert.ok(!phrases.includes("一个"), "Should filter out blacklisted bigram '一个'");
+  });
+
+  it("filters out phrases containing stop characters", () => {
+    const phrases = extractIntentPhrases("我的项目部署");
+    // "我的" contains stop character "的"
+    assert.ok(!phrases.includes("我的"), "Should filter out phrase with stop char");
+  });
+
+  it("extracts meaningful bigrams without stop chars", () => {
+    const phrases = extractIntentPhrases("部署生产系统");
+    // Should extract meaningful phrases like "部署", "生产", "系统", "部署生产", "生产系统"
+    assert.ok(phrases.some(p => p.includes("部署")), "Should contain '部署'");
+    assert.ok(phrases.some(p => p.includes("生产")), "Should contain '生产'");
+    assert.ok(phrases.some(p => p.includes("系统")), "Should contain '系统'");
+  });
+
+  it("filters trigrams that start/end with stop chars", () => {
+    const phrases = extractIntentPhrases("的是项目");
+    // Trigram "的是项" starts with stop char, should be filtered
+    const hasInvalidTrigram = phrases.some(p => p.length === 3 && CHINESE_STOP_CHARS.has(p[0]));
+    assert.ok(!hasInvalidTrigram, "Should filter trigrams starting with stop char");
+  });
+
+  it("extracts multi-character words without stop chars at end", () => {
+    const phrases = extractIntentPhrases("部署系统的");
+    // Should not extract "系统的" because it ends with "的"
+    const invalidPhrases = phrases.filter(p => p.endsWith("的") && p.length > 1);
+    assert.equal(invalidPhrases.length, 0, "Should not extract phrases ending with stop char");
   });
 });

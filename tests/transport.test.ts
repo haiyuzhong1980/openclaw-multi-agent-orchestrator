@@ -102,6 +102,11 @@ describe("Transport Layer", () => {
         content: "Ack this message",
       });
 
+      // Must receive first to claim the message
+      const messages = await receiver.receive();
+      assert.ok(messages.some((m) => m.id === msg.id));
+
+      // Now we can ack the claimed message
       const success = await receiver.ack(msg.id);
       assert.equal(success, true);
 
@@ -145,6 +150,9 @@ describe("Transport Layer", () => {
           to: "receiver-hist",
           content: `Message ${i}`,
         });
+        // Must receive first to claim the message
+        await receiver.receive();
+        // Then ack the claimed message
         await receiver.ack(msg.id);
       }
 
@@ -260,6 +268,9 @@ describe("MailboxManager", () => {
     await bob.initialize();
 
     const msg = await alice.send("bob-ack", MessageType.message, "Ack me");
+    // Must receive first to claim the message
+    await bob.receive();
+    // Then ack the claimed message
     const success = await bob.ack(msg.id);
     assert.equal(success, true);
   });

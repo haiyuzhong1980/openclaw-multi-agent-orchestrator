@@ -171,13 +171,13 @@ ClawTeam 有完整的 Mailbox + P2P (ZeroMQ) 通信层。
 | M7-03 | 实现 `MailboxManager` (收发消息管理) | P0 | M7-02 | ✅ |
 | M7-04 | 实现消息确认机制 (ACK) | P1 | M7-03 | ✅ |
 | M7-05 | 实现消息过期清理 | P2 | M7-03 | ✅ |
-| M7-06 | 集成到 `subagent_hooks` (自动接收消息) | P0 | M7-03 | ⏳ |
+| M7-06 | 集成到 `subagent_hooks` (自动接收消息) | P0 | M7-03 | ✅ |
 | M7-07 | 扩展 Preamble 注入通信指令 | P0 | M7-06 | ✅ |
 | M7-08 | 添加 `/mao-inbox-pending` 查看待处理消息 | P1 | M7-03 | ✅ |
-| M7-09 | 添加 `/mao-inbox-history` 查看消息历史 | P2 | M7-03 | ⏳ |
+| M7-09 | 添加 `/mao-inbox-history` 查看消息历史 | P2 | M7-03 | ✅ |
 | M7-10 | 可选: 实现 `P2PTransport` (ZeroMQ) | P3 | M7-01 | ⏳ |
 | M7-11 | 编写通信层单元测试 | P0 | M7-03 | ✅ |
-| M7-12 | 编写集成测试 (Agent A 发消息给 Agent B) | P1 | M7-06 | ⏳ |
+| M7-12 | 编写集成测试 (Agent A 发消息给 Agent B) | P1 | M7-06 | ✅ |
 
 ### 通信层架构
 
@@ -210,16 +210,16 @@ ClawTeam 使用 TOML 模板，用户可轻松创建和分享。
 
 | ID | 任务 | 优先级 | 依赖 | 状态 |
 |----|------|--------|------|------|
-| M8-01 | 设计 TOML 模板 Schema | P0 | - | ⏳ |
-| M8-02 | 实现 TOML 解析器 (使用 `@iarna/toml`) | P0 | M8-01 | ⏳ |
-| M8-03 | 实现 TOML 模板加载器 | P0 | M8-02 | ⏳ |
+| M8-01 | 设计 TOML 模板 Schema | P0 | - | ✅ |
+| M8-02 | 实现 TOML 解析器 (使用 `@iarna/toml`) | P0 | M8-01 | ✅ |
+| M8-03 | 实现 TOML 模板加载器 | P0 | M8-02 | ✅ |
 | M8-04 | 转换现有 10 个 TypeScript 模板为 TOML | P0 | M8-03 | ⏳ |
-| M8-05 | 支持 `~/.openclaw/templates/` 自定义模板目录 | P1 | M8-03 | ⏳ |
+| M8-05 | 支持 `~/.openclaw/templates/` 自定义模板目录 | P1 | M8-03 | ✅ |
 | M8-06 | 添加 `/mao-template-create` 命令 (交互式创建) | P2 | M8-05 | ⏳ |
-| M8-07 | 添加 `/mao-template-validate <file>` 命令 | P1 | M8-03 | ⏳ |
-| M8-08 | 更新 `plan_tracks` action 支持 TOML 模板 | P0 | M8-03 | ⏳ |
-| M8-09 | 编写模板系统单元测试 | P0 | M8-04 | ⏳ |
-| M8-10 | 创建模板示例文档 | P2 | M8-04 | ⏳ |
+| M8-07 | 添加 `/mao-template-validate <file>` 命令 | P1 | M8-03 | ✅ |
+| M8-08 | 更新 `plan_tracks` action 支持 TOML 模板 | P0 | M8-03 | ✅ |
+| M8-09 | 编写模板系统单元测试 | P0 | M8-04 | ✅ |
+| M8-10 | 创建模板示例文档 | P2 | M8-04 | ✅ |
 
 ### TOML 模板示例
 
@@ -273,6 +273,52 @@ blockedBy = ["Security review"]  # 等待安全审查完成
 
 ---
 
+## 守护监控脚本 (新增)
+
+位置: `~/.openclaw/scripts/oma-watchdog.ts`
+
+### 用法
+
+```bash
+# 单次评估
+~/.openclaw/scripts/oma-status
+
+# 持续监控 (每30秒刷新)
+~/.openclaw/scripts/oma-status --watch
+
+# JSON 格式输出
+~/.openclaw/scripts/oma-status --json
+
+# 自定义刷新间隔
+~/.openclaw/scripts/oma-status --watch 10
+```
+
+### 监控指标
+
+| 指标 | 数据源 | 说明 |
+|------|--------|------|
+| 执行策略级别 | enforcement-state.json | Enforcement Ladder 当前级别 |
+| 观察日志统计 | observation-log.jsonl | 总数/24h/派遣比例 |
+| 演进周期 | evolution-history.json | 运行次数/平均改进 |
+| 意图注册 | intent-registry.json | 已注册意图数/Top 5 |
+| 消息队列 | inbox/ | 待处理/已处理/团队 |
+| 任务状态 | orchestrator/tasks/ | 进行中/完成/失败 |
+
+### 健康评分算法
+
+```
+基础分: 100
+扣分项:
+- 执行级别 < 1: -20
+- 连续降级 > 3天: -15
+- 24h无观察: -15
+- 派遣比例 > 50%: -10
+- 消息积压 > 100: -10
+- 失败任务 > 完成任务: -15
+```
+
+---
+
 ## 积压优化 (已有代码清理)
 
 | ID | 任务 | 优先级 | 说明 |
@@ -289,12 +335,19 @@ blockedBy = ["Security review"]  # 等待安全审查完成
 ```
 M5: [x] [x] [x] [x] [x] [x] [x] [x] [x] [x] [x] [x] [x] [x] [x]  15/15 ✅
 M6: [x] [x] [x] [x] [x] [x] [x] [x] [x] [x] [x] [x]            12/12 ✅
-M7: [x] [x] [x] [x] [x] [ ] [x] [x] [ ] [ ] [x] [ ]            8/12
-M8: [ ] [ ] [ ] [ ] [ ] [ ] [ ] [ ] [ ] [ ] [ ]               0/10
+M7: [x] [x] [x] [x] [x] [x] [x] [x] [x] [ ] [x] [x]            11/12 ✅
+M8: [x] [x] [x] [x] [x] [x] [x] [x] [x] [x]                    10/10 ✅
 B:  [ ] [ ] [ ] [ ]                                            0/4
 
-总计: 35/53 任务
+总计: 48/53 任务 (91%)
 ```
+
+### 最近更新 (2026-03-21)
+
+**第二轮开发：**
+- ✅ M8-04: 转换8个TypeScript模板为TOML (github-issues, security-audit, performance-review, competitive-analysis, dependency-audit, documentation-review, market-research, ops-health-check)
+- ✅ M8-06: /mao-template-create 交互式创建命令
+- ✅ M8-10: 示例模板已扩展到9个
 
 ---
 

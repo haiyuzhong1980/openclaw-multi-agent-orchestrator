@@ -3,13 +3,24 @@
  *
  * Features:
  * - Send/receive messages via Transport abstraction
- * - ACK mechanism for reliable delivery
+ * - ACK mechanism for reliable delivery with atomic claim
  * - Message filtering by type
  * - Auto-cleanup of expired messages
+ *
+ * Atomic Claim Mechanism:
+ * When receive() is called, messages are atomically claimed before being returned.
+ * This prevents race conditions where multiple processes could process the same message.
+ * 
+ * Flow:
+ * 1. receive() atomically claims messages (moves to claiming dir)
+ * 2. Messages are returned to the caller
+ * 3. ack() must be called to confirm processing (moves to processed dir)
+ * 4. If ack() is not called, messages are recovered after timeout
  */
 
 import type { TeamMessage, MessageType, AgentIdentity } from "./types.ts";
 import { FileTransport, type Transport, type TransportConfig, createTransport } from "./transport.ts";
+import { sanitizeAgentId, sanitizeTeamName } from "./path-utils.ts";
 
 export interface MailboxOptions {
   transportType?: "file" | "p2p";
@@ -31,6 +42,13 @@ export class MailboxManager {
     sharedRoot: string,
     options: MailboxOptions = {}
   ) {
+    // Validate identity path components to prevent path injection
+    // This will throw if agentId or teamName contain invalid characters
+    sanitizeAgentId(identity.agentId);
+    if (identity.teamName) {
+      sanitizeTeamName(identity.teamName);
+    }
+    
     this.identity = identity;
     this.sharedRoot = sharedRoot;
     this.options = {
@@ -86,6 +104,13 @@ export class MailboxManager {
 
   /**
    * Receive pending messages.
+   * 
+   * IMPORTANT: This method atomically claims messages before returning them.
+   * You MUST call ack() for each processed message, otherwise the message
+   * will be recovered to pending after CLAIM_TIMEOUT_MS (default: 1 minute).
+   * 
+   * This prevents race conditions where multiple agents/processes could
+   * process the same message simultaneously.
    */
   async receive(): Promise<TeamMessage[]> {
     const messages = await this.transport.receive();
@@ -100,6 +125,11 @@ export class MailboxManager {
 
   /**
    * Get pending messages and optionally auto-acknowledge.
+   * 
+   * WARNING: When autoAck is enabled, messages are acknowledged immediately
+   * before being returned. Only use this when you want "at most once" delivery
+   * semantics. For reliable processing, use receive() + explicit ack() after
+   * processing is complete.
    */
   async poll(): Promise<TeamMessage[]> {
     const messages = await this.receive();
@@ -115,6 +145,12 @@ export class MailboxManager {
 
   /**
    * Acknowledge a message.
+   * 
+   * This confirms that a message has been successfully processed.
+   * The message is moved from the claiming directory to processed.
+   * 
+   * IMPORTANT: Only call ack() after you have successfully processed the message.
+   * If ack() is not called, the message will be recovered after timeout.
    */
   async ack(messageId: string): Promise<boolean> {
     return this.transport.ack(messageId);

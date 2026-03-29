@@ -4,6 +4,7 @@ import type { EnforcementState } from "./enforcement-ladder.ts";
 import type { UserKeywords } from "./user-keywords.ts";
 import { addUserKeyword } from "./user-keywords.ts";
 import { applyLevelChange } from "./enforcement-ladder.ts";
+import { loggers } from "./errors.ts";
 
 export interface OnboardingState {
   completed: boolean;
@@ -36,7 +37,8 @@ export function loadOnboardingState(sharedRoot: string): OnboardingState {
       parsed.userProfile.customPhrases = [];
     }
     return parsed;
-  } catch {
+  } catch (error) {
+    loggers.onboarding.error(`Failed to load onboarding state`, error, { path: filePath });
     return createDefaultOnboardingState();
   }
 }

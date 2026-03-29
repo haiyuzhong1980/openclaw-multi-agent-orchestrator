@@ -1,5 +1,8 @@
 import { inferRecentWindowDays } from "./track-planner.ts";
 import type { PlannedTrack, TrackContentType } from "./types.ts";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { loadTomlTemplates, type TomlTemplate } from "./toml-parser.ts";
 
 export interface TrackTemplate {
   id: string;
@@ -138,6 +141,50 @@ export function listTemplates(category?: string): TrackTemplate[] {
 }
 
 /**
+ * M8-05: Load user-defined TOML templates from ~/.openclaw/templates/
+ */
+export function loadUserTemplates(): TomlTemplate[] {
+  const userTemplatesDir = join(homedir(), ".openclaw", "templates");
+  return loadTomlTemplates(userTemplatesDir);
+}
+
+/**
+ * M8-08: Convert TOML template to TrackTemplate.
+ */
+export function tomlToTrackTemplate(toml: TomlTemplate): TrackTemplate {
+  // Map TOML template to TrackTemplate
+  const category: TrackTemplate["category"] = "development"; // Default category
+
+  // Build output contract from tasks
+  const outputContract = toml.tasks.map((t) => `${t.subject} (${t.owner})`);
+
+  // Build failure contract
+  const failureContract = ["Report blockers clearly", "Do not skip incomplete work"];
+
+  return {
+    id: toml.id,
+    name: toml.name,
+    description: toml.description,
+    category,
+    defaultGoal: toml.leader?.task ?? toml.agents[0]?.task ?? "Complete assigned tasks",
+    outputContract,
+    failureContract,
+  };
+}
+
+/**
+ * M8-08: Find a TOML template by ID or keyword.
+ */
+export function findTomlTemplate(query: string, userTemplates: TomlTemplate[]): TomlTemplate | undefined {
+  const lower = query.toLowerCase();
+  return userTemplates.find(
+    (t) =>
+      t.id.toLowerCase() === lower ||
+      t.name.toLowerCase().includes(lower)
+  );
+}
+
+/**
  * Build a PlannedTrack from a template + custom goal.
  */
 export function buildTrackFromTemplate(
@@ -170,6 +217,7 @@ export function buildTrackFromTemplate(
 
 /**
  * Plan tracks from explicit template IDs or custom definitions.
+ * M8-08: Now supports TOML templates from ~/.openclaw/templates/
  */
 export function planCustomTracks(params: {
   templateIds?: string[];
@@ -179,12 +227,24 @@ export function planCustomTracks(params: {
   const windowDays = inferRecentWindowDays(params.request);
   const tracks: PlannedTrack[] = [];
 
+  // M8-05: Load user-defined TOML templates
+  const userTemplates = loadUserTemplates();
+
   // From templates
   if (params.templateIds) {
     for (const id of params.templateIds) {
+      // First try built-in templates
       const template = findTemplate(id);
       if (template) {
         tracks.push(buildTrackFromTemplate(template, undefined, windowDays));
+        continue;
+      }
+
+      // M8-08: Then try TOML templates
+      const tomlTemplate = findTomlTemplate(id, userTemplates);
+      if (tomlTemplate) {
+        const trackTemplate = tomlToTrackTemplate(tomlTemplate);
+        tracks.push(buildTrackFromTemplate(trackTemplate, undefined, windowDays));
       }
     }
   }
